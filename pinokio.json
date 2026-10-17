@@ -1,0 +1,5 @@
+{
+  "title": "Drama 3 Offload Studio",
+  "description": "Fish Audio Drama 3 (expressive TTS, voice cloning, voice design, directing notes) from the fishaudio/Drama-3 Space. Models: the full model for 24+ GB NVIDIA GPUs, the Small GGUF (drama3-small, Japanese and English) for 16 GB, and MLX 4-bit / 3-bit conversions of the full model for Apple Silicon (64 / 48 GB, untested on a Mac).",
+  "icon": "icon.png"
+}
