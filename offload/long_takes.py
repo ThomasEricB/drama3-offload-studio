@@ -147,12 +147,72 @@ SENTENCE_END = ".!?…。！？"
 CLAUSE_END = ",;:—–-、，；："
 
 
-def join_pause(text: str, pcm: bytes, rate: int = 44100) -> bytes:
-    """Silence to put after a chunk that ends on text, whose audio is pcm."""
+def join_pause(text: str, pcm: bytes, rate: int = 44100, tone: list[bytes] | None = None) -> bytes:
+    """The pause to put after a chunk that ends on text, whose audio is pcm: room tone
+    of the chunks in `tone` (see room_tone), or silence."""
     end = text.rstrip().rstrip("\"'”’)]»」』").rstrip()
     kind = "sentence" if end[-1:] in SENTENCE_END else "clause" if end[-1:] in CLAUSE_END else "word"
     missing = JOIN_PAUSE_S[kind] - edge_silence(pcm, rate)[1]
-    return bytes(2 * int(max(0.0, missing) * rate))
+    return room_tone(tone or [pcm], int(max(0.0, missing) * rate))
+
+
+# Room tone: a cloned voice keeps its recording's background (hiss, hum, room), and a
+# pause of digital silence between two chunks makes that background drop out and come
+# back. The pause is filled instead with noise of the background's spectrum and level,
+# measured on the quietest stretches of the take's audio. Takes whose background is
+# below ROOM_TONE_MIN_RMS keep silent pauses.
+ROOM_TONE_FRAME = 4096  # samples per analysis frame (93 ms: 11 Hz bins, so a mains hum stays near its pitch)
+ROOM_TONE_CEILING = 0.02  # RMS above which a frame is never background (-34 dBFS)
+ROOM_TONE_MIN_RMS = 0.0005  # quieter backgrounds are left silent (-66 dBFS)
+ROOM_TONE_MIN_FRAMES = 4  # background needed to measure it (0.37 s)
+
+
+def background(pcms: list[bytes]):
+    """(magnitude spectrum, RMS) of the quietest frames of 16-bit PCM, or None when there
+    is too little background or it is below ROOM_TONE_MIN_RMS."""
+    import numpy as np
+
+    frames = []
+    for pcm in pcms:
+        samples = np.frombuffer(pcm[: len(pcm) // 2 * 2], dtype="<i2").astype(np.float32) / 32768
+        count = len(samples) // ROOM_TONE_FRAME
+        if count:
+            frames.append(samples[: count * ROOM_TONE_FRAME].reshape(count, ROOM_TONE_FRAME))
+    if not frames:
+        return None
+    frames = np.concatenate(frames)
+    rms = np.sqrt((frames ** 2).mean(axis=1))
+    # the quietest frames, up to twice the 10th percentile: pauses and breaths' tails, not speech
+    quiet = frames[(rms <= min(ROOM_TONE_CEILING, 2 * np.percentile(rms, 10))) & (rms > 0)]
+    if len(quiet) < ROOM_TONE_MIN_FRAMES:
+        return None
+    level = float(np.sqrt((quiet ** 2).mean()))
+    if level < ROOM_TONE_MIN_RMS:
+        return None
+    window = np.hanning(ROOM_TONE_FRAME).astype(np.float32)
+    spectrum = np.sqrt((np.abs(np.fft.rfft(quiet * window, axis=1)) ** 2).mean(axis=0))
+    return spectrum, level
+
+
+def room_tone(pcms: list[bytes], samples: int) -> bytes:
+    """`samples` of 16-bit noise shaped like the background of pcms, or silence. Seeded by
+    the audio, so a take replays with the same pauses."""
+    import zlib
+
+    import numpy as np
+
+    if samples <= 0:
+        return b""
+    measured = background(pcms)
+    if measured is None:
+        return bytes(2 * samples)
+    spectrum, level = measured
+    rng = np.random.default_rng(zlib.crc32(pcms[-1][-8192:]) + samples)
+    white = np.fft.rfft(rng.standard_normal(samples))
+    bins = np.linspace(0, len(spectrum) - 1, len(white))
+    shaped = np.fft.irfft(white * np.interp(bins, np.arange(len(spectrum)), spectrum), n=samples)
+    shaped *= level / max(float(np.sqrt((shaped ** 2).mean())), 1e-9)
+    return (np.clip(shaped, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
 
 
 def keepalive(fn, *args):
@@ -393,9 +453,10 @@ def make_engine(base):
                 cue = subtitles.cue(chunk.text) if timed else None
                 if cue is not None and cue.start is not None:
                     # a subtitle cue starts at its time (or at once, if the one before ran over)
-                    pause = bytes(2 * max(0, int(cue.start * 44100) - position // 2))
+                    pause = room_tone([r.pcm for r in records[-3:]], max(0, int(cue.start * 44100) - position // 2))
                 elif records:  # a pause at the join, kept out of the chunk's cached audio
-                    pause = join_pause(plain(records[-1].text), records[-1].pcm)
+                    pause = join_pause(plain(records[-1].text), records[-1].pcm,
+                                       tone=[r.pcm for r in records[-3:]])
                 else:
                     pause = b""
                 if pause:
