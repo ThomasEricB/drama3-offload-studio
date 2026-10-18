@@ -9,6 +9,9 @@
 - Retake / Edit of a multi-chunk take (EXPERIMENTAL, off by default): an edit
   regenerates only the chunks whose text changed and keeps the others' audio; a note
   redoes every chunk, each guided by its old version.
+- A Direction the user writes ("Direction: …\nLine: …") holds for the whole take: every
+  chunk is sent under it with the Line's own [cues] kept (a Retake note, instead, replaces
+  the cues; see parse_turn).
 - Reference clips: 20 s by default, as the Space; up to 60 s (the engine's limit)
   when unlocked.
 
@@ -68,13 +71,31 @@ def spoken(text: str) -> str:
 RETAKE = re.compile(r"Direction: (?P<note>[^\n]*)\nLine: (?P<line>.*)", re.S)
 
 
-def parse_retake(text: str) -> tuple[str | None, str]:
-    """(note, words) of a turn the Space's retake_text wrote, else (None, text)."""
+def parse_turn(text: str) -> tuple[str | None, str | None, str]:
+    """(note, direction, words) of a turn.
+
+    note: a Retake the Space's retake_text wrote (every sentence opens with [note]);
+    its words lose the acting cues, which the note replaces. direction: a
+    "Direction: …\nLine: …" the user wrote; its Line keeps its own cues, and every
+    chunk of it is sent under the same Direction."""
     match = RETAKE.fullmatch(text)
     if not match:
-        return None, text
-    note = match.group("note")
-    return note, match.group("line").replace(f"[{note}] ", "")
+        return None, None, text
+    note, line = match.group("note"), match.group("line")
+    if line.startswith(f"[{note}] "):
+        return note, None, line.replace(f"[{note}] ", "")
+    return None, note, line
+
+
+def parse_retake(text: str) -> tuple[str | None, str]:
+    """(note, words) of a turn (see parse_turn); a user's Direction is not a note."""
+    note, _, words = parse_turn(text)
+    return note, words
+
+
+def directed_turn(direction: str | None, text: str) -> str:
+    """One chunk of a user-directed Line, under the take's Direction."""
+    return f"Direction: {direction}\nLine: {text}" if direction else text
 
 
 def retake_turn(note: str, words: str) -> str:
@@ -99,6 +120,7 @@ class ChunkAudio:
 class LongTake:
     line: str
     chunks: list[ChunkAudio]
+    direction: str | None = None  # the user's Direction (all chunks were made under it)
 
 
 CACHE: collections.OrderedDict[str, LongTake] = collections.OrderedDict()
@@ -269,8 +291,8 @@ def make_engine(base):
                         pcm += event["pcm"]
                     elif event["type"] == "speech.audio.done" and event.get("frames"):
                         # kept (codes + audio) so an edit of this line can be infilled
-                        words = parse_retake(request.text)[1]
-                        remember(request.text, LongTake(line=words, chunks=[
+                        _, direction, words = parse_turn(request.text)
+                        remember(request.text, LongTake(line=words, direction=direction, chunks=[
                             ChunkAudio(words, request.text, self.last_codes(event["frames"]), bytes(pcm))]))
                     yield event
                 return
@@ -282,13 +304,13 @@ def make_engine(base):
         # Planning ---------------------------------------------------------------
 
         def plan(self, request):
-            note, words = parse_retake(request.text)
+            note, direction, words = parse_turn(request.text)
             if subtitles.is_timed(words):
                 return self.plan_timed(request, note, words)
             previous = long_take(request.history[-1]) if request.history else None
             single = CACHE.get(request.history[-1]) if request.history else None
             if (previous is None and single is not None and note is None and SETTINGS["infill"]
-                    and spoken(single.line) != spoken(words)):
+                    and direction == single.direction and spoken(single.line) != spoken(words)):
                 # An edit of a one-chunk take: its changed words can be infilled
                 planned = chunking.plan_edit(single.line, [c.text for c in single.chunks], words)
                 if planned:
@@ -299,7 +321,7 @@ def make_engine(base):
                         f"This take was generated in {len(previous.chunks)} chunks. Tick “Retake / Edit long "
                         "takes (experimental)” under the stage to retake or edit it")
                 planned = chunking.plan_edit(previous.line, [c.text for c in previous.chunks], words)
-                if note:
+                if note or direction != previous.direction:  # a new direction redoes every chunk
                     for chunk in planned:
                         chunk.changed = True
                 if not planned:
@@ -419,7 +441,7 @@ def make_engine(base):
                            f"({window.end - window.start}) -> {frames} (hint {window.frames_hint}), heard {share:.0%}, "
                            f"whole chunk {whole:.2f} (was {before:.2f})")
                 if share >= infill.VERIFY_MIN and whole >= before - infill.WHOLE_SLACK:
-                    return ChunkAudio(chunk.text, chunk.text, codes, pcm, heard)
+                    return ChunkAudio(chunk.text, directed_turn(parse_turn(request.text)[1], chunk.text), codes, pcm, heard)
             infill.log("the infilled chunk did not pass (new words not heard, or the chunk matches its script "
                        "worse than before); regenerating the chunk")
             return None
@@ -441,6 +463,7 @@ def make_engine(base):
             log(f"{len(planned)} chunks, {regenerate} to generate"
                 + (f", {len(planned) - regenerate} kept" if previous is not None else "")
                 + (f", note “{note}”" if note else ""))
+            direction = parse_turn(request.text)[1]
             records: list[ChunkAudio] = []
             frames_total, finish, first_audio = 0, "stop", None
             timed = subtitles.is_timed(words)
@@ -471,7 +494,7 @@ def make_engine(base):
                         yield {"type": "speech.audio.delta", "pcm": record.pcm[offset:offset + PACKET_BYTES]}
                 else:
                     text = subtitles.spoken_turn(cue) if cue is not None else chunk.text
-                    turn = retake_turn(note, spoken(text) or text) if note else text
+                    turn = retake_turn(note, spoken(text) or text) if note else directed_turn(direction, text)
                     if note and cue is not None and cue.frames:
                         turn += f" [audio tokens: {cue.frames}]"
                     streaming = SETTINGS["lookahead"]
@@ -517,7 +540,7 @@ def make_engine(base):
                 records.append(record)
             if not records:
                 raise de.RequestError("no chunk produced audio")
-            remember(request.text, LongTake(line=words, chunks=records))
+            remember(request.text, LongTake(line=words, chunks=records, direction=direction))
             total_ms = round((time.perf_counter() - started) * 1000)
             log(f"{len(records)} chunks, {frames_total} frames in {total_ms / 1000:.1f}s")
             yield {"type": "speech.audio.done", "finish_reason": finish, "frames": frames_total,
