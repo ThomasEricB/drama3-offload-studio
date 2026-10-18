@@ -38,7 +38,7 @@ def log(message: str) -> None:
 
 
 def load_codes(silence_codes_path: str) -> None:
-    SILENCE_CODES[:] = sorted({int(c) for c in json.load(open(silence_codes_path))})
+    SILENCE_CODES[:] = sorted({int(c) for c in json.load(open(silence_codes_path, encoding="utf-8"))})
     SILENCE_SET.clear()
     SILENCE_SET.update(SILENCE_CODES)
 

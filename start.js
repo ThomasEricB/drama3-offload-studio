@@ -6,6 +6,9 @@ module.exports = {
       params: {
         venv: "env",
         env: {
+          // Python's UTF-8 mode: the Space reads its UI files (studio_content.json, hero.html, ...) without an
+          // encoding, which on Windows means cp1252, and they hold UTF-8 emoji (UnicodeDecodeError at startup)
+          PYTHONUTF8: "1",
           // faster-whisper (reference-clip transcription, CPU) caches its model here instead of ~/.cache/whisper
           WHISPER_DIR: "{{path.resolve(cwd, 'cache/whisper')}}",
           // Whisper runs on the CPU (reference transcripts, infill edits, subtitles); the Space uses 2 threads
