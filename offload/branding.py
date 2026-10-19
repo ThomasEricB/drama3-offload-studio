@@ -74,6 +74,8 @@ def rebranded_ui(backend: str):
     read_text, blocks_init = Path.read_text, gr.Blocks.__init__
 
     def patched_read_text(self, *args, **kwargs):
+        if not args:  # the Space's files are UTF-8; Windows would read them as cp1252
+            kwargs.setdefault("encoding", "utf-8")
         text = read_text(self, *args, **kwargs)
         return rebrand_page(text, device_name(backend)) if self.name == "hero.html" else text
 
