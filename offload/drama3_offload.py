@@ -31,6 +31,7 @@ Environment:
 
 from __future__ import annotations
 
+import json
 import os
 import time
 
@@ -79,26 +80,35 @@ def host_alias(cpu_tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
 
 
 @triton.jit
-def gather_experts_kernel(src_ptr, ids_ptr, dst_ptr, row_words, BLOCK: tl.constexpr):
-    """dst[pair] = src[ids[pair]], one expert row of int64 words per pair."""
+def gather_experts_kernel(host_ptr, cache_ptr, ids_ptr, slots_ptr, dst_ptr, row_words, BLOCK: tl.constexpr):
+    """dst[pair] = expert ids[pair]'s row: from the VRAM cache if it holds that expert
+    (slots[expert] >= 0), else from host RAM. One row of int64 words per pair."""
     pair = tl.program_id(0)
     chunk = tl.program_id(1)
     expert = tl.load(ids_ptr + pair).to(tl.int64)
+    slot = tl.load(slots_ptr + expert).to(tl.int64)
     offs = chunk.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < row_words
-    words = tl.load(src_ptr + expert * row_words + offs, mask=mask)
+    if slot >= 0:
+        words = tl.load(cache_ptr + slot * row_words + offs, mask=mask)
+    else:
+        words = tl.load(host_ptr + expert * row_words + offs, mask=mask)
     tl.store(dst_ptr + pair.to(tl.int64) * row_words + offs, words, mask=mask)
 
 
-def gather_experts(weight: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
-    """weight[ids] for a (host-aliased) [E, rows, cols] FP8 tensor, into device memory."""
-    experts = weight.shape[0]
-    src = weight.view(torch.uint8).view(experts, -1).view(torch.int64)
+def _words(weight: torch.Tensor) -> torch.Tensor:
+    return weight.view(torch.uint8).view(weight.shape[0], -1).view(torch.int64)
+
+
+def gather_experts(weight: torch.Tensor, cache: torch.Tensor, slots: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+    """weight[ids] for a host-aliased [E, rows, cols] FP8 tensor, into device memory,
+    reading the experts the cache holds from VRAM instead."""
+    src, cached = _words(weight), _words(cache)
     row_words = src.shape[1]
     dst = torch.empty((ids.numel(), row_words), dtype=torch.int64, device=ids.device)
     with torch.cuda.device(ids.device):
         gather_experts_kernel[(ids.numel(), triton.cdiv(row_words, GATHER_BLOCK))](
-            src, ids, dst, row_words, BLOCK=GATHER_BLOCK
+            src, cached, ids, slots, dst, row_words, BLOCK=GATHER_BLOCK
         )
     return dst.view(torch.uint8).view(weight.dtype).view(ids.numel(), *weight.shape[1:])
 
@@ -106,12 +116,16 @@ def gather_experts(weight: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
 # ─── Patched expert forward ───────────────────────────────────────────────────
 
 
+# Kept out of torch.compile: it is Triton kernels already, and each layer's cache has its own
+# size, which would recompile every layer for every decode graph (past the recompile limit)
+@torch.compiler.disable
 def offloaded_experts_forward(self, x: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor):
     from fish_speech.models.text2semantic.fish_omni.fp8_moe import fp8_moe_forward
 
     pairs = topk_ids.numel()
     if pairs > GATHER_MAX_PAIRS:
-        # Prefill: nearly every expert is hit; reading in place is already bandwidth-bound.
+        # Prefill: nearly every expert is hit; reading in place is already bandwidth-bound
+        # (running the cached experts from VRAM instead measured no faster: 19 ms either way).
         return fp8_moe_forward(
             x, topk_ids, topk_weights,
             self.w13_weight, self.w13_scale_inv, self.w2_weight, self.w2_scale_inv,
@@ -121,12 +135,25 @@ def offloaded_experts_forward(self, x: torch.Tensor, topk_ids: torch.Tensor, top
     local_ids = torch.arange(pairs, device=flat.device).view_as(topk_ids)
     return fp8_moe_forward(
         x, local_ids, topk_weights,
-        gather_experts(self.w13_weight, flat), self.w13_scale_inv[flat],
-        gather_experts(self.w2_weight, flat), self.w2_scale_inv[flat],
+        gather_experts(self.w13_weight, self._drama3_cache["w13_weight"], self._drama3_slots, flat),
+        self.w13_scale_inv[flat],
+        gather_experts(self.w2_weight, self._drama3_cache["w2_weight"], self._drama3_slots, flat),
+        self.w2_scale_inv[flat],
     )
 
 
 # ─── Placement ────────────────────────────────────────────────────────────────
+#
+# Decode routes each token to 8 of a layer's 256 experts, and not evenly: measured over
+# 8 takes (clone, Surprise, whispers, anger), a layer's 64 most-used experts took 66% of
+# its routings. So VRAM holds the most-used experts of every layer (a cache, ranked by
+# offload/expert_profile.json) instead of all the experts of some layers: with the same
+# 5 GiB, 44% of the expert reads of other takes came from VRAM instead of 17%. Every
+# layer keeps all its experts in pinned RAM too; a layer whose experts all fit is
+# simply a GPU layer. Without the profile, whole layers are placed as before.
+
+PROFILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "expert_profile.json")
+NAMES = ("w13_weight", "w2_weight")
 
 
 def tensor_bytes(module: torch.nn.Module) -> int:
@@ -135,12 +162,11 @@ def tensor_bytes(module: torch.nn.Module) -> int:
 
 def offloadable_bytes(experts: torch.nn.Module) -> int:
     """The FP8 weights that move to host RAM; their small fp32 scales stay on the GPU."""
-    return sum(experts._buffers[name].numel() * experts._buffers[name].element_size()
-               for name in ("w13_weight", "w2_weight"))
+    return sum(experts._buffers[name].numel() * experts._buffers[name].element_size() for name in NAMES)
 
 
 # Startup facts the placement is recomputed from when the reference limit changes
-STATE: dict = {"experts": [], "device": None, "budget": 0, "per_layer": 0, "fixed": False}
+STATE: dict = {"experts": [], "device": None, "budget": 0, "per_layer": 0, "fixed": False, "ranking": []}
 
 
 def ref_unlocked_at_start() -> bool:
@@ -156,30 +182,59 @@ def reserve_bytes(unlocked: bool) -> float:
     return float(os.environ.get(name, default)) * 2**30
 
 
-def layers_in_ram(unlocked: bool) -> int:
-    """Expert layers kept in host RAM for a reference limit (20 s or 60 s)."""
-    count = len(STATE["experts"])
+def ranking(count: int, experts: int, use_profile: bool) -> list[tuple[int, int]]:
+    """(layer, expert) in the order they get VRAM: most-used first (by the profile),
+    unused ones layer by layer; or, without a profile, whole layers from the first."""
+    by_layer = [(layer, expert) for layer in range(count) for expert in range(experts)]
+    if not use_profile:
+        return by_layer
+    try:
+        with open(PROFILE_PATH, encoding="utf-8") as f:
+            counts = json.load(f)["counts"]
+        if len(counts) != count or any(len(row) != experts for row in counts):
+            raise ValueError(f"shape {len(counts)} x {len(counts[0]) if counts else 0}")
+    except (OSError, ValueError, KeyError) as error:
+        log(f"no usable expert profile ({error}); placing whole layers")
+        return by_layer
+    return sorted(by_layer, key=lambda cell: -counts[cell[0]][cell[1]])  # stable: ties stay in layer order
+
+
+def plan(unlocked: bool) -> list[list[int]]:
+    """The experts each layer keeps in VRAM, most-used first, for a reference limit (20 s or 60 s)."""
+    count, experts = len(STATE["experts"]), STATE["experts"][0].w13_scale_inv.shape[0]
     if STATE["fixed"] is not False:
-        return STATE["fixed"]
-    on_gpu = int((STATE["budget"] - reserve_bytes(unlocked)) // STATE["per_layer"])
-    return count - max(0, min(count, on_gpu))
+        cells = (count - STATE["fixed"]) * experts
+    else:
+        per_expert = STATE["per_layer"] / experts
+        cells = int(max(0, STATE["budget"] - reserve_bytes(unlocked)) // per_expert)
+    hot: list[list[int]] = [[] for _ in range(count)]
+    for layer, expert in STATE["ranking"][:cells]:
+        hot[layer].append(expert)
+    return hot
 
 
-def plan_layers(expert_modules: list, resident_bytes: int, device: torch.device) -> int:
-    """How many layers keep their experts in host RAM."""
+def describe(hot: list[list[int]]) -> tuple[int, int, int]:
+    """(layers with every expert in VRAM, layers with some in RAM, experts cached in those)."""
+    experts = STATE["experts"][0].w13_scale_inv.shape[0]
+    full = sum(len(h) == experts for h in hot)
+    return full, len(hot) - full, sum(len(h) for h in hot if len(h) < experts)
+
+
+def size_budget(expert_modules: list, resident_bytes: int, device: torch.device) -> None:
     setting = os.environ.get("DRAMA3_OFFLOAD_LAYERS", "auto").strip().lower() or "auto"
     count = len(expert_modules)
+    experts = expert_modules[0].w13_scale_inv.shape[0]
     STATE.update(experts=expert_modules, device=device, per_layer=offloadable_bytes(expert_modules[0]))
     if setting != "auto":
         try:
             STATE["fixed"] = max(0, min(count, int(setting)))
         except ValueError:
             raise ValueError(f"DRAMA3_OFFLOAD_LAYERS must be 'auto' or a number of layers (0-{count}); got {setting!r}") from None
-        return STATE["fixed"]
+    STATE["ranking"] = ranking(count, experts, STATE["fixed"] is False)
     free, total = torch.cuda.mem_get_info(device)
     STATE["budget"] = free - resident_bytes
-    unlocked = ref_unlocked_at_start()
-    in_ram = layers_in_ram(unlocked)
+    if STATE["fixed"] is not False:
+        return
     for mode in (False, True):
         short = reserve_bytes(mode) - STATE["budget"]
         if short > 0:
@@ -187,45 +242,74 @@ def plan_layers(expert_modules: list, resident_bytes: int, device: torch.device)
                 f"{'60' if mode else '20'} s reserve (working memory + ~2.5 GiB of desktop headroom): the longest "
                 "prompts may run out of memory. Close other GPU apps or run without a desktop; lowering "
                 "the reserve trades away that headroom.")
+    unlocked = ref_unlocked_at_start()
+    full, partial, cached = describe(plan(unlocked))
+    other = describe(plan(not unlocked))
     log(f"{torch.cuda.get_device_name(device)}: {free / 2**30:.1f} of {total / 2**30:.1f} GiB free; "
         f"dense weights + codec {resident_bytes / 2**30:.1f} GiB, reserve {reserve_bytes(unlocked) / 2**30:.1f} GiB "
         f"({'60' if unlocked else '20'} s references), experts {STATE['per_layer'] / 2**20:.0f} MiB per layer -> "
-        f"{count - in_ram} of {count} layers fit (with {'20' if unlocked else '60'} s references: "
-        f"{count - layers_in_ram(not unlocked)})")
-    return in_ram
+        f"{full} of {count} layers fit, plus the {cached} most-used experts of the other {partial} "
+        f"(with {'20' if unlocked else '60'} s references: {other[0]} layers + {other[2]} experts)")
 
 
-def to_ram(experts: torch.nn.Module, device: torch.device) -> int:
-    """Move one layer's FP8 experts into pinned RAM (aliased for the GPU). Bytes moved."""
-    moved = 0
-    for name in ("w13_weight", "w2_weight"):
+def pin(experts: torch.nn.Module, device: torch.device) -> None:
+    """Keep one layer's FP8 experts in pinned RAM (aliased for the GPU)."""
+    host = {}
+    for name in NAMES:
         weight = experts._buffers[name]
-        source = weight if weight.device.type == "cpu" else weight.cpu()
         try:
-            alias = host_alias(source, device)
+            host[name] = host_alias(weight if weight.device.type == "cpu" else weight.cpu(), device)
         except RuntimeError as error:
             raise RuntimeError(
-                f"could not pin RAM for the offloaded experts: {error}. Free some RAM, or keep more layers on the "
-                "GPU with a lower DRAMA3_VRAM_RESERVE_GB / DRAMA3_OFFLOAD_LAYERS in start.js."
+                f"could not pin RAM for the experts: {error}. They need 30 GiB of free RAM; close other apps."
             ) from error
-        experts._buffers[name] = alias
-        moved += alias.numel() * alias.element_size()
-    experts.forward = offloaded_experts_forward.__get__(experts)
-    return moved
+        experts._buffers[name] = host[name]
+    experts._drama3_host = host
 
 
-def to_gpu(experts: torch.nn.Module) -> int:
-    """Copy one layer's experts from pinned RAM back into VRAM. Bytes moved."""
-    moved = 0
-    for name in ("w13_weight", "w2_weight"):
-        experts._buffers[name] = experts._buffers[name].clone()  # allocates in VRAM, reads RAM over PCIe
-        moved += experts._buffers[name].numel() * experts._buffers[name].element_size()
-    experts.__dict__.pop("forward", None)  # back to MoEExperts.forward (the FP8 kernel on VRAM)
-    return moved
+def place(experts: torch.nn.Module, hot: list[int], device: torch.device) -> bool:
+    """Give one layer its VRAM share: all its experts (an ordinary GPU layer) or a cache of
+    the hot ones in front of its pinned RAM. False when it already has that share."""
+    if getattr(experts, "_drama3_hot", None) == hot:
+        return False
+    host, count = experts._drama3_host, experts.w13_scale_inv.shape[0]
+    for attribute in ("_drama3_cache", "_drama3_slots"):
+        experts.__dict__.pop(attribute, None)
+    if len(hot) == count:
+        for name in NAMES:
+            experts._buffers[name] = host[name].clone()  # allocates in VRAM, reads RAM over PCIe
+        experts.__dict__.pop("forward", None)  # back to MoEExperts.forward (the FP8 kernel on VRAM)
+    else:
+        ids = torch.tensor(hot or [0], dtype=torch.long, device=device)  # a 1-row placeholder when none fit
+        slots = torch.full((count,), -1, dtype=torch.int32, device=device)
+        slots[ids[:len(hot)]] = torch.arange(len(hot), dtype=torch.int32, device=device)
+        for name in NAMES:
+            experts._buffers[name] = host[name]
+        experts._drama3_cache = {name: host[name][ids] for name in NAMES}  # VRAM copies, read over PCIe
+        experts._drama3_slots = slots
+        experts.forward = offloaded_experts_forward.__get__(experts)
+    experts._drama3_hot = hot
+    return True
+
+
+def apply(hot: list[list[int]]) -> int:
+    """Place every layer; how many changed."""
+    global PLACEMENT, PLACEMENT_LABEL
+    device = STATE["device"]
+    changed = sum(place(experts, layer_hot, device) for experts, layer_hot in zip(STATE["experts"], hot))
+    full, partial, cached = describe(hot)
+    PLACEMENT = (partial, len(hot))
+    experts = STATE["experts"][0].w13_scale_inv.shape[0]
+    PLACEMENT_LABEL = (f"{partial}/{len(hot)} expert layers in RAM" + (f", {cached / experts / max(1, partial):.0%} of "
+                       "their experts cached in VRAM" if cached else "")) if partial else ""
+    return changed
+
+
+PLACEMENT_LABEL = ""
 
 
 def offload(model: torch.nn.Module, codec: torch.nn.Module, device: torch.device) -> None:
-    """Replace the routed-expert weights of the planned layers by host aliases (on CPU, before the move)."""
+    """Pin the experts in RAM and give the GPU its share (on CPU, before the model moves)."""
     expert_modules = [layer.mlp.experts for layer in model.backbone.model.layers
                       if getattr(layer.mlp, "experts", None) is not None and layer.mlp.experts.fp8]
     if not expert_modules:
@@ -234,18 +318,22 @@ def offload(model: torch.nn.Module, codec: torch.nn.Module, device: torch.device
     expert_bytes = sum(offloadable_bytes(m) for m in expert_modules)
     # Everything that goes to the GPU whatever the plan: dense weights, scales, codec
     resident = tensor_bytes(model) + tensor_bytes(codec) - expert_bytes
-    count = plan_layers(expert_modules, resident, device)
-    global PLACEMENT
-    PLACEMENT = (count, len(expert_modules))
-    if count == 0:
+    size_budget(expert_modules, resident, device)
+    experts = expert_modules[0].w13_scale_inv.shape[0]
+    hot = plan(ref_unlocked_at_start())
+    if all(len(h) == experts for layout in (hot, plan(not ref_unlocked_at_start())) for h in layout):
         log("all experts fit on the GPU; offload off")
+        STATE["experts"] = []  # nothing to rebalance
         return
     started = time.perf_counter()
-    # The last layers go to host RAM; which ones does not change the PCIe traffic.
-    host = sum(to_ram(experts, device) for experts in expert_modules[len(expert_modules) - count:])
-    log(f"{count} of {len(expert_modules)} layers keep their experts in pinned RAM "
-        f"({host / 2**30:.1f} GiB, pinned in {time.perf_counter() - started:.0f}s); "
-        f"{(expert_bytes - host) / 2**30:.1f} GiB of experts on the GPU")
+    for module in expert_modules:
+        pin(module, device)
+    apply(hot)
+    full, partial, cached = describe(hot)
+    log(f"all {len(expert_modules)} layers keep their experts in pinned RAM ({expert_bytes / 2**30:.1f} GiB); "
+        f"VRAM holds {full} whole layers and {cached} experts of the other {partial} "
+        f"({(full * experts + cached) * STATE['per_layer'] / experts / 2**30:.1f} GiB, "
+        f"placed in {time.perf_counter() - started:.0f}s)")
 
 
 def rebalance(engine, unlocked: bool) -> str:
@@ -253,36 +341,34 @@ def rebalance(engine, unlocked: bool) -> str:
     take lock). The decode CUDA graphs captured the experts' addresses, so they are
     dropped first (which also frees their memory before anything moves into VRAM)
     and captured again afterwards."""
-    global PLACEMENT
     experts, device = STATE["experts"], STATE["device"]
     if not experts:
         return "no offload in use"
-    target, current = layers_in_ram(unlocked), PLACEMENT[0]
-    count = len(experts)
-    if target == current:
-        return f"{count - current}/{count} expert layers on the GPU (unchanged)"
+    hot = plan(unlocked)
+    if all(getattr(e, "_drama3_hot", None) == h for e, h in zip(experts, hot)):
+        return f"{PLACEMENT_LABEL or 'every expert on the GPU'} (unchanged)"
     started = time.perf_counter()
     with torch.cuda.device(device):
         if engine is not None:
             engine.graphs = None
             engine.model.decode_graphs = None
         torch.cuda.synchronize(device)
-        torch.cuda.empty_cache()
-        if target > current:  # more in RAM (60 s): layers count-target .. count-current move out
-            moved = sum(to_ram(e, device) for e in experts[count - target:count - current])
-        else:  # fewer in RAM (20 s): layers count-current .. count-target come back
-            moved = sum(to_gpu(e) for e in experts[count - current:count - target])
-        PLACEMENT = (target, count)
+        # Shrink first, then grow: a layer losing VRAM frees it before another takes it
+        order = sorted(range(len(experts)), key=lambda i: len(hot[i]) - len(getattr(experts[i], "_drama3_hot", [])))
+        changed = 0
+        for index in order:
+            changed += place(experts[index], hot[index], device)
+            torch.cuda.empty_cache()
+        apply(hot)
         torch.cuda.synchronize(device)
         torch.cuda.empty_cache()
-        torch._C._host_emptyCache()  # give freed pinned RAM back to the system
         if engine is not None:
             import drama3_engine
 
             for bucket in drama3_engine.WARM_UP_BUCKETS:
                 engine.graph_for(bucket)
-    message = (f"{count - target}/{count} expert layers on the GPU, {target} in RAM "
-               f"({moved / 2**30:.1f} GiB moved in {time.perf_counter() - started:.0f}s)")
+    message = (f"{PLACEMENT_LABEL or 'every expert on the GPU'} ({changed} layers re-placed in "
+               f"{time.perf_counter() - started:.0f}s)")
     log(message)
     return message
 

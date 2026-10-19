@@ -46,13 +46,13 @@ Inline tags such as `[sighs]` and `[laughs]` place events at that point in the l
 | Status | Tested (RTX 5090, 32 GB) | Untested: dependencies verified to resolve | Untested on a Mac. MLX: dependencies resolve and the models load, no take completed yet (see below); eager fallback: verified on Linux without CUDA |
 
 - NVIDIA: RTX 40-series (Ada) or newer has the FP8 tensor cores the experts run on; RTX 30-series and older stop with a clear message. torch 2.13 is the CUDA 13 build, so the driver must be 580 or newer. With all experts in RAM the VRAM peak was about 14 GiB, so 16-24 GB cards should work, but only 32 GB was tested.
-- System RAM (NVIDIA): up to 30 GiB holds the experts that don't fit in VRAM. Loading peaks at about 40 GiB: 64 GB recommended for 24 GB cards, 48 GB for 32 GB cards.
+- System RAM (NVIDIA): 30 GiB of pinned RAM holds every expert (the VRAM holds copies of the most-used ones). Loading peaks at about 40 GiB: 64 GB recommended for 24 GB cards, 48 GB for 32 GB cards.
 - Disk: about 41 GB for the checkpoint (`models/drama-3` in the launcher folder) plus about 10 GB for the Python environment.
 - Not supported: AMD GPUs, Intel Macs (no PyTorch 2.13 build), CPU-only machines. Install stops on these with a message.
 
 ### Windows
 
-Install takes torch 2.13.0+cu130 from the PyTorch index (PyPI's Windows torch is CPU-only) and `triton-windows` 3.7.1, the build of the Triton version torch 2.13 uses on Linux. `torch.compile` is on, as on Linux (triton-windows bundles its own C compiler). Small GGUF depends on it: its Q8_0 matrices and IQ3_XXS experts are expanded on every step, which compile fuses into a few kernels (measured on the 5090: one 8192x2048 Q8_0 matrix 0.3-0.55 ms uncompiled vs 0.03 ms compiled, the 8 routed experts of a layer 3.6 ms vs 0.08 ms), so uncompiled it runs several times slower than real time. The full model loses about 25% without it (24.3 instead of 18.3 ms per frame). If a layer still fails to compile on some machine, it runs uncompiled instead of failing the take, with the same output. Compiling on Windows is untested; Start takes longer while it compiles. The expert offload pins RAM the same way as on Linux; if Windows refuses to pin that much, Start stops with a message suggesting a lower `DRAMA3_VRAM_RESERVE_GB`.
+Install takes torch 2.13.0+cu130 from the PyTorch index (PyPI's Windows torch is CPU-only) and `triton-windows` 3.7.1, the build of the Triton version torch 2.13 uses on Linux. `torch.compile` is on, as on Linux (triton-windows bundles its own C compiler). Small GGUF depends on it: its Q8_0 matrices and IQ3_XXS experts are expanded on every step, which compile fuses into a few kernels (measured on the 5090: one 8192x2048 Q8_0 matrix 0.3-0.55 ms uncompiled vs 0.03 ms compiled, the 8 routed experts of a layer 3.6 ms vs 0.08 ms), so uncompiled it runs several times slower than real time. The full model loses about 25% without it (24.3 instead of 18.3 ms per frame). If a layer still fails to compile on some machine, it runs uncompiled instead of failing the take, with the same output. Compiling on Windows is untested; Start takes longer while it compiles. The expert offload pins RAM the same way as on Linux (30 GiB); if Windows refuses to pin that much, Start stops with a message saying so.
 
 ### macOS: MLX
 
@@ -90,18 +90,23 @@ What was verified, on Linux with CUDA hidden so the code ran exactly as it would
 
 ### Expert offload (fits on a 32 GB GPU)
 
-The Space loads all ~37 GiB of weights onto one GPU. This launcher adds `offload/drama3_offload.py`, which keeps the routed MoE experts of some layers in **pinned system RAM** instead. The experts are 30 GiB of FP8 weights: 40 layers, 768 MiB each. The Space's code in `app/` is not modified.
+The Space loads all ~37 GiB of weights onto one GPU. This launcher adds `offload/drama3_offload.py`, which keeps the routed MoE experts in **pinned system RAM** and the **most-used ones in VRAM**. The experts are 30 GiB of FP8 weights: 40 layers of 256 experts, 768 MiB per layer. The Space's code in `app/` is not modified.
 
 - Each offloaded weight is a CUDA tensor that aliases pinned host memory. `torch.compile`, the Triton FP8 kernels and CUDA-graph capture work unchanged, and the bytes are read over PCIe.
 - A decode step gathers just the 8 experts each layer routes to (24 MiB per layer) into VRAM with a wide copy kernel (~50 GiB/s on PCIe 5 x16), then runs the original FP8 GEMM. The math is the same, on the same bytes.
-- Measured on an RTX 5090 (PCIe 5 x16):
+- **Expert cache.** Routing is uneven: over 8 takes (clone, Surprise, whispers, anger), a layer's 64 most-used experts took 66% of its routings. So VRAM holds the most-used experts of every layer rather than all the experts of some layers, ranked by `offload/expert_profile.json` (how often each expert was chosen while decoding those takes). The gather reads a cached expert from VRAM and the others from RAM. With the same VRAM, 44% of the expert reads of other takes came from VRAM, instead of 17-40% with whole layers. Every layer keeps all its experts in pinned RAM as well (30 GiB, whatever the card), so the cache can be re-sized without reloading. Prefill (the prompt, which uses nearly every expert) still reads RAM in place: running the cached experts from VRAM there measured no faster.
+- Measured on an RTX 5090 (PCIe 5 x16), same session, the same 6 takes; a 24 GB card was simulated by raising the reserve by 7 GiB (22.5 GiB free, as reported from an RTX 4090):
 
-| Experts in RAM | VRAM for weights | Decode step | Speed (real takes) |
+| VRAM for experts | Placement | Decode step | Speed (real takes) |
 | --- | --- | --- | --- |
-| 0 of 40 (the Space) | ~37.5 GiB | — | doesn't fit |
-| 24 of 40 (auto, 20 s references, 9 GiB reserve) | 19.5 GiB | 18.3 ms | ~2x real-time |
-| 28 of 40 (auto, 60 s references, 12 GiB reserve) | 16.5 GiB | 20.2 ms | 1.5-1.8x (1-1.5x with a 60 s reference) |
-| 40 of 40 | 7.5 GiB | 25.8 ms | 1.2-1.5x real-time |
+| 12 GiB (5090, 20 s references) | 16 whole layers (before) | 20.3-21.2 ms | 1.9-2.1x real time |
+| 12 GiB (5090, 20 s references) | **4,157 most-used experts** (41% of all) | **15.2 ms** | **2.3-2.75x** |
+| 9 GiB (5090, 60 s references) | 3,144 most-used experts | 17.6 ms | |
+| 5.2 GiB (24 GB card) | 7 whole layers (before) | 22.5 ms | 1.7-1.9x |
+| 5.2 GiB (24 GB card) | **1,772 most-used experts** | **20.0 ms** | **1.8-2.1x** |
+| none | all 40 layers in RAM | 25.8 ms | 1.2-1.5x |
+
+Whole layers measured 18.3 ms on an earlier day; the same-session numbers above are the comparison. The Space's own all-on-GPU placement (~37.5 GiB of weights) does not fit a 32 GB card. The decode step is measured once per start and varies by about 1 ms.
 
 Real time is 46 ms per frame (21.5 frames/s). A slower PCIe link (Gen 4, or x8) makes the offloaded layers proportionally slower.
 
@@ -109,11 +114,11 @@ Settings live in the `env` block of `start.js`:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `DRAMA3_OFFLOAD_LAYERS` | `auto` | `auto` sizes the split from free VRAM at launch. A number forces that many layers to RAM. `0` gives the Space's original all-on-GPU behaviour (needs ~45 GB). |
+| `DRAMA3_OFFLOAD_LAYERS` | `auto` | `auto` fills the VRAM left after the reserve with the most-used experts. A number keeps that many whole layers in RAM and the rest on the GPU (the placement before the cache). `0` gives the Space's original all-on-GPU behaviour (needs ~45 GB). |
 | `DRAMA3_VRAM_RESERVE_GB` | `9` | VRAM that `auto` leaves free with 20 s references. The engine's working memory peaked at ~6.5 GiB (20 s reference, 2-take histories of long takes, Surprise retakes, long scripts); the worst case left 3.0 GiB free on the 5090. |
 | `DRAMA3_VRAM_RESERVE_60S_GB` | `12` | The same with 60 s references unlocked: working memory peaked at ~8.7 GiB; the worst case left 3.7 GiB free. |
 
-The start log reports the split it chose, for example `[offload] ... 16 of 40 layers fit (with 60 s references: 12)`.
+The start log reports the split it chose, for example `[offload] ... 0 of 40 layers fit, plus the 4157 most-used experts of the other 40 (with 60 s references: 0 layers + 3133 experts)`.
 
 **torch.compile settings per take.** The Space applies its compile settings (`emulate_precision_casts`, a recompile limit of 32) once, in the thread that builds the engine; in this torch they are per thread and every take runs in a new one. `offload/serve.py` applies them before every take, so graphs compiled later (the 4096-row decode graph long prompts need, now also captured at startup) are built the same way.
 
@@ -137,16 +142,16 @@ The limits were not re-fitted for the Small GGUF. `DRAMA3_STALL_GUARD` in `start
 
 ### 20 s and 60 s references
 
-60 s references need about 2.2 GiB more working memory, so the expert split follows the **voice each take uses**: on the 5090, 16 expert layers stay on the GPU for takes with a voice of 20 s or less, and 12 for takes with a longer clone voice.
+60 s references need about 2.2 GiB more working memory, so the expert split follows the **voice each take uses**: on the 5090, the 4,157 most-used experts stay on the GPU for takes with a voice of 20 s or less, and 3,144 for takes with a longer clone voice.
 
 - **Allow reference clips up to 60 s** (Clone panel) only decides how long *new* clips may be. Clips added while it is on are marked **“· 60 s”** in the voice list and keep working after you untick it.
-- A take (or retake, or edit) with a “· 60 s” voice switches to the 60 s layout; the next take with a shorter voice switches back to the faster one. The switch happens between takes, in its own lock: it drops the decode CUDA graphs (they hold the experts' addresses), moves 4 layers (3 GiB) between VRAM and pinned RAM and captures the graphs again, ~1 s (4-8 s the first time). Nothing moves while consecutive takes need the same layout. Tested: 7 takes alternating 20 s and 60 s voices re-placed the model 4 times, exactly at the changes, all takes complete; VRAM and RAM return to the same levels.
+- A take (or retake, or edit) with a “· 60 s” voice switches to the 60 s layout; the next take with a shorter voice switches back to the faster one. The switch happens between takes, in its own lock: it drops the decode CUDA graphs (they hold the experts' addresses), re-sizes the expert cache (3 GiB) from pinned RAM and captures the graphs again, ~1 s (5 s the first time). Nothing moves while consecutive takes need the same layout. Tested with the cache: 5 takes alternating a 38 s and a 10 s voice re-sized it 4 times, exactly at the changes, all takes complete.
 - The checkboxes and the hint show the server's current settings on every page load (also after switching in another tab).
 - A fixed `DRAMA3_OFFLOAD_LAYERS` turns the switching off. Small GGUF needs no switching (60 s references fit 16 GB).
 
 ### Other GPUs (estimates)
 
-Only the RTX 5090 was measured. The table applies the measured numbers (7.5 GiB of dense weights and codec, 0.75 GiB per expert layer, 6.5 / 8.7 GiB working memory, ~2.4 GiB taken by the desktop) and scales speed: the decode step is 6.9 ms of compute on the 5090 (scaled by memory bandwidth for other GPUs, as batch-1 decoding is bandwidth-bound) plus 0.47 ms per expert layer in RAM on PCIe 5.0 x16 (about twice that on PCIe 4.0 x16 or 5.0 x8). The model reproduces the 5090's measured 18.3 / 20.2 ms. Real time is 46.5 ms per frame; "x" is how much faster than real time a take is generated.
+These estimates are for whole layers in VRAM, from before the expert cache, which measured 10% (24 GB) to 27% (32 GB) faster on the 5090 (above); with the cache every card pins all 30 GiB of experts in RAM. Only the RTX 5090 was measured. The table applies the measured numbers (7.5 GiB of dense weights and codec, 0.75 GiB per expert layer, 6.5 / 8.7 GiB working memory, ~2.4 GiB taken by the desktop) and scales speed: the decode step is 6.9 ms of compute on the 5090 (scaled by memory bandwidth for other GPUs, as batch-1 decoding is bandwidth-bound) plus 0.47 ms per expert layer in RAM on PCIe 5.0 x16 (about twice that on PCIe 4.0 x16 or 5.0 x8). The model reproduces the 5090's measured 18.3 / 20.2 ms. Real time is 46.5 ms per frame; "x" is how much faster than real time a take is generated.
 
 | GPU | 20 s references | 60 s references | RAM for experts |
 | --- | --- | --- | --- |

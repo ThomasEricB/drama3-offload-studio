@@ -41,8 +41,7 @@ def _full_label(backend: str) -> str:
         name = torch.cuda.get_device_name(torch.cuda.current_device())
         import drama3_offload
 
-        offloaded, layers = drama3_offload.PLACEMENT
-        return f"{name} · {offloaded}/{layers} expert layers in RAM" if offloaded else name
+        return f"{name} · {drama3_offload.PLACEMENT_LABEL}" if drama3_offload.PLACEMENT_LABEL else name
     if backend == "mlx":
         import platform
 
