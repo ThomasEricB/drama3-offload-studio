@@ -22,8 +22,8 @@ module.exports = {
           // Stall guard (offload/stall_guard.py): a take that turns into a low drone is ended where the drone
           // began, before it is heard (a long script's chunk is made again once); 0 = off
           DRAMA3_STALL_GUARD: "1",
-          // torch.compile speeds decode ~25%, but on Windows it can need the MSVC build tools; off there by default
-          DRAMA3_COMPILE: "{{platform === 'win32' ? '0' : '1'}}",
+          // torch.compile speeds decode ~25%; where it cannot compile (e.g. Windows without a C compiler), those layers run uncompiled
+          DRAMA3_COMPILE: "1",
           // Initial state of the Studio checkboxes (also the setting for API-only use):
           // reference clips up to 60 s instead of 20 s, experimental Retake / Edit of multi-chunk takes,
           // long-script chunks voiced knowing the next one, and empty-note edits by infilling the changed words

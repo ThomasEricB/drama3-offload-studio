@@ -35,8 +35,8 @@ module.exports = {
           // 60 s box moves experts between GPU and RAM to switch between the two)
           DRAMA3_VRAM_RESERVE_GB: "9",
           DRAMA3_VRAM_RESERVE_60S_GB: "12",
-          // torch.compile speeds decode ~25%, but on Windows it can need the MSVC build tools; off there by default
-          DRAMA3_COMPILE: "{{platform === 'win32' ? '0' : '1'}}",
+          // torch.compile speeds decode ~25%; where it cannot compile (e.g. Windows without a C compiler), those layers run uncompiled
+          DRAMA3_COMPILE: "1",
           // Initial state of the Studio checkboxes (also the setting for API-only use):
           // reference clips up to 60 s instead of 20 s, experimental Retake / Edit of multi-chunk takes,
           // long-script chunks voiced knowing the next one, and empty-note edits by infilling the changed words

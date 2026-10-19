@@ -52,7 +52,7 @@ Inline tags such as `[sighs]` and `[laughs]` place events at that point in the l
 
 ### Windows
 
-Install takes torch 2.13.0+cu130 from the PyTorch index (PyPI's Windows torch is CPU-only) and `triton-windows` 3.7.1, the build of the Triton version torch 2.13 uses on Linux. `torch.compile` is **off by default on Windows** (`DRAMA3_COMPILE=0`) because it can need the MSVC build tools. Measured on Linux, compile off makes decode ~25% slower (24.3 instead of 18.3 ms per frame), still about 1.9x real-time. If Visual Studio Build Tools are installed, set `DRAMA3_COMPILE` to `1` in `start.js`. The expert offload pins RAM the same way as on Linux; if Windows refuses to pin that much, Start stops with a message suggesting a lower `DRAMA3_VRAM_RESERVE_GB`.
+Install takes torch 2.13.0+cu130 from the PyTorch index (PyPI's Windows torch is CPU-only) and `triton-windows` 3.7.1, the build of the Triton version torch 2.13 uses on Linux. `torch.compile` is on, as on Linux (triton-windows bundles its own C compiler). Small GGUF depends on it: its Q8_0 matrices and IQ3_XXS experts are expanded on every step, which compile fuses into a few kernels (measured on the 5090: one 8192x2048 Q8_0 matrix 0.3-0.55 ms uncompiled vs 0.03 ms compiled, the 8 routed experts of a layer 3.6 ms vs 0.08 ms), so uncompiled it runs several times slower than real time. The full model loses about 25% without it (24.3 instead of 18.3 ms per frame). If a layer still fails to compile on some machine, it runs uncompiled instead of failing the take, with the same output. Compiling on Windows is untested; Start takes longer while it compiles. The expert offload pins RAM the same way as on Linux; if Windows refuses to pin that much, Start stops with a message suggesting a lower `DRAMA3_VRAM_RESERVE_GB`.
 
 ### macOS: MLX
 
@@ -173,7 +173,7 @@ Other optional environment variables:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `DRAMA3_WARM_UP` | `1` | `0` skips the startup warm-up take |
-| `DRAMA3_COMPILE` | `1` (`0` on Windows) | `0` turns off regional `torch.compile` (NVIDIA only) |
+| `DRAMA3_COMPILE` | `1` | `0` turns off regional `torch.compile` (NVIDIA only) |
 | `DRAMA3_BACKEND` | `auto` | `cuda` (NVIDIA engine + offload), `mlx` (Apple Silicon; set by the MLX Start entries) or `portable` (eager engine); `auto` picks `cuda` when available, else `portable` |
 | `DRAMA3_MLX_DIR` | set per MLX entry | The MLX model folder: `models/drama-3-mlx-4bit` or `models/drama-3-mlx-3bit` |
 | `DRAMA3_DEVICE` | `mps` | Device of the portable engine: `mps` or `cpu` (CPU works but is far too slow for real use) |

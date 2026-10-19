@@ -209,6 +209,9 @@ def compile_settings() -> None:
     inductor_config.emulate_precision_casts = True
     # Decode graphs exist for 4 KV buckets; layers recompile per bucket and layer kind
     dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, 64)
+    # A layer that fails to compile (Windows without a working compiler) runs eagerly
+    # instead of failing the take: slower, but the same output
+    dynamo_config.suppress_errors = True
 
 
 if not PREVIEW:
