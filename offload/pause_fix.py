@@ -26,6 +26,16 @@ import torch.nn.functional as F
 import stall_guard
 
 MAX_PAUSE_FRAMES = int(os.environ.get("DRAMA3_MAX_PAUSE_FRAMES", 10))
+# A pause the model dithers (silence codes broken by single quiet frames that are not
+# in the list) never makes MAX_PAUSE_FRAMES in a row: it is also cut once
+# PAUSE_WINDOW_MAX of the last PAUSE_WINDOW frames are silent or QUIET_CODES
+PAUSE_WINDOW = int(os.environ.get("DRAMA3_PAUSE_WINDOW", 20))
+PAUSE_WINDOW_MAX = int(os.environ.get("DRAMA3_PAUSE_WINDOW_MAX", 10))
+# The quiet first codes such pauses dither with (each 3-6x more common there than in
+# speech, where they are about 1% of frames: breaths, pause edges). Not silence codes:
+# they never start a pause count, but they count in the window and are masked with
+# the silence codes while a pause is cut, so the model has to speak
+QUIET_CODES = (112, 436, 1242, 1573, 2546, 2586, 3303)
 END_RATIO = float(os.environ.get("DRAMA3_PAUSE_END_RATIO", 2.0))
 CAP_RATIO = float(os.environ.get("DRAMA3_PAUSE_CAP_RATIO", 3.0))
 _CJK_PUNCT = {0x3002, 0x3001, 0xFF01, 0xFF1F, 0x300C, 0x300D, 0x2026, 0x30FB, 0xFF08, 0xFF09}
@@ -89,7 +99,13 @@ def install(silence_codes_path: str) -> None:
             lookup[codes] = True
             self.silence_candidates = candidates[None].to(device)
             self.silence_lookup = lookup.to(device)
+            quiet = torch.tensor(QUIET_CODES, dtype=torch.long)
+            candidates[1 + quiet] = True
+            lookup[quiet] = True
+            self.pause_candidates = candidates[None].to(device)
+            self.pause_lookup = lookup.to(device)
             self.silent_run = torch.zeros(1, dtype=torch.long, device=device)
+            self.silent_window = torch.zeros(PAUSE_WINDOW, dtype=torch.long, device=device)
             self.status = torch.zeros(3, dtype=torch.long, device=device)  # main, finite, silent run
 
         def run(self, kv_len: int) -> None:
@@ -97,7 +113,8 @@ def install(silence_codes_path: str) -> None:
             logits = F.linear(self.hidden, self.candidate_head)
             finite = torch.isfinite(logits).all()
             if MAX_PAUSE_FRAMES > 0:
-                clamp = self.silence_candidates & (self.silent_run >= MAX_PAUSE_FRAMES)
+                clamp = ((self.silence_candidates & (self.silent_run >= MAX_PAUSE_FRAMES))
+                         | (self.pause_candidates & (self.silent_window.sum() >= PAUSE_WINDOW_MAX)))
                 logits = logits.masked_fill(clamp, float("-inf"))
             sampled = de.decode_candidates(
                 tower, self.candidate_ids, logits, self.hidden, self.position, self.frame, self.history,
@@ -108,6 +125,8 @@ def install(silence_codes_path: str) -> None:
             self.out_frames.index_copy_(0, self.out_index.clamp(max=de.MAX_NEW_TOKENS_CAP), sampled)
             silent = self.silence_lookup.index_select(0, sampled[0, 1:2])  # [1], no host sync
             self.silent_run.copy_(torch.where(silent, self.silent_run + 1, torch.zeros_like(self.silent_run)))
+            paused = self.pause_lookup.index_select(0, sampled[0, 1:2])
+            self.silent_window.copy_(torch.cat((self.silent_window[1:], paused.long())))
             self.status.copy_(torch.stack((sampled[0, 0], finite.long(), self.silent_run[0])))
             self.hidden.copy_(hidden[0])
             self.frame.copy_(sampled)
@@ -118,6 +137,7 @@ def install(silence_codes_path: str) -> None:
         def start(self, hidden, position, prompt_frames, temperature, top_k, top_p) -> None:
             super().start(hidden, position, prompt_frames, temperature, top_k, top_p)
             self.silent_run.zero_()
+            self.silent_window.zero_()
 
     de.DecodeGraphs = PauseClampGraphs
     base_engine = de.Engine
