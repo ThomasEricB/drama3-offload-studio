@@ -81,14 +81,24 @@ def split(text: str, limit: int = CHUNK_BYTES) -> list[str]:
     pieces = _cut_after(pieces, CLAUSE_MARKS, limit)
     pieces = _cut_after(pieces, " ", limit)
     pieces = _cut_by_length(pieces, limit)
-    chunks, current = [], ""
+    chunks, current = [], []
     for piece, _ in pieces:
-        if current and size(current + piece) > limit:
-            chunks.append(current)
-            current = ""
-        current += piece
-    chunks.append(current)
+        if current and size("".join(current) + piece) > limit:
+            # Cues and tags with no words direct what follows them: they open the next
+            # chunk. A chunk of cues alone would have the model improvise (or read ahead)
+            cut = len(current)
+            while cut and _wordless(current[cut - 1]):
+                cut -= 1
+            if cut:
+                chunks.append("".join(current[:cut]))
+                current = current[cut:]
+        current.append(piece)
+    chunks.append("".join(current))
     return [chunk.strip(WHITE) for chunk in chunks if chunk.strip(WHITE)]
+
+
+def _wordless(text: str) -> bool:
+    return not re.sub(r"\[[^\[\]]*\]|<[^<>]*>", "", text).strip(WHITE)
 
 
 # ─── Edits of a chunked take ──────────────────────────────────────────────────
