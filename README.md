@@ -150,6 +150,18 @@ A cloned voice copies the delivery of its reference clip, and a loud, energetic 
 
 `DRAMA3_TAG_GUIDANCE` (default `4`; `0` = off). Not yet measured with the Small GGUF, so it is off there.
 
+### Every word read, while streaming
+
+The model sometimes loses its place in a line: it skips a span (more often a tagged one), stops before the end, or reads a `Direction:` aloud. `offload/word_check.py` and `offload/long_takes.py` catch these without giving up streaming:
+- **Directed first takes:** `Direction: …` / `Line: …` is Drama 3's directing format, learned as a conversation about an earlier take (the Space uses it so for retakes). On a first take the model often lost its place in it, so a first take is sent as the line under a `[style prefix]` instead, which Drama 3 never speaks; retakes keep the `Direction:` form.
+- **Opening check:** the server holds a take's first 2.5 s before any audio goes out anyway; within that, the first 2 s are transcribed and must match the start of the line, or the take starts again (at most twice). A spoken direction or a skipped opening span scored 0.53 or less, good openings mostly 0.88-1.0.
+- **Ending check:** when a take ends, it is transcribed, and if its last words are missing (two or more, or any after a stall) they are made as a continuation (the take so far as context, as a long script's next chunk) and stream after a short pause.
+- **Whisper on the GPU** for these checks (a 2 s opening in ~0.08 s instead of ~2 s on the CPU, ~1.5 GB of the VRAM reserve), loaded in the background at Start; without CUDA Whisper they use the CPU one.
+
+`Direction: Donald Trump is having a chat with Elizabeth Holmes from Theranos` / `Line: <whispers> Okay... Alright... Good chat. </whispers> Are you being real, right now?`, streamed: complete in 11 of 12 takes with a random voice (1 of 12 before) and 10 of 10 with a clone (3 of 10 before), the span whispered and the rest voiced; first audio after ~1.3-2.9 s with a random voice when no restart is needed.
+
+**Check every word before playing** (Studio checkbox under the stage, off by default; `DRAMA3_WORD_CHECK=1` for the API): each take, and each chunk of a long script, is held until made and its whole transcript compared with the line (below 90 % it is made again, at most twice, and the best is sent). Every word is checked, but a take plays once made instead of streaming.
+
 ### 20 s and 60 s references
 
 60 s references need about 2.2 GiB more working memory, so the expert split follows the **voice each take uses**: on the 5090, the 4,157 most-used experts stay on the GPU for takes with a voice of 20 s or less, and 3,144 for takes with a longer clone voice.

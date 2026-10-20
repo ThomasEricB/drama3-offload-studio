@@ -161,6 +161,10 @@ if not PREVIEW:
     import zerogpu_backend  # noqa: E402
 
 branding.apply_to_server(server, app, backend)
+if not PREVIEW and backend in ("cuda", "small"):
+    import word_check  # noqa: E402
+
+    word_check.load_gpu_whisper()  # word / opening checks of streamed takes, without delaying them
 long_takes.install_server(server)  # no script limit, empty-note edits, 20 / 60 s references
 
 import reference_trim  # noqa: E402

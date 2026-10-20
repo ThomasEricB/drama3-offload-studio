@@ -9,7 +9,8 @@ is built, without changing the Space's files:
   how the script will be chunked and which chunks the next Retake / Edit regenerates.
 - The script's character counter shows the chunk count instead of "/ 600", and the
   language / duration hints.
-- In the same card: "Read ahead across chunks" (lookahead), "Edit by infilling", and
+- In the same card: "Read ahead across chunks" (lookahead), "Edit by infilling", "Check
+  every word before playing" (word_check.py), and
   subtitles: import an .srt as a timed script, download the .srt of the current take.
 """
 
@@ -198,6 +199,11 @@ def extended_studio():
                 infill_box = gr.Checkbox(value=long_takes.SETTINGS["infill"], label="Edit by infilling",
                                          info="With an empty note, an edit regenerates only the words that changed "
                                               "and keeps the audio around them; large edits redo the chunk.")
+                word_box = gr.Checkbox(value=long_takes.SETTINGS["word_check"], label="Check every word before playing",
+                                       info="Each take is held until Whisper confirms every word was said, and made "
+                                            "again (up to twice) if words are missing or a direction was read aloud. "
+                                            "Takes then play once made instead of streaming. Off: takes stream, and "
+                                            "only their opening is checked.")
                 with gr.Row():
                     srt_in = gr.UploadButton("Import subtitles (.srt)", file_types=[".srt"], size="sm")
                     srt_out = gr.Button("Subtitles of this take (.srt)", size="sm")
@@ -211,6 +217,7 @@ def extended_studio():
 
             lookahead.change(setting("lookahead"), inputs=lookahead, queue=False, api_visibility="private")
             infill_box.change(setting("infill"), inputs=infill_box, queue=False, api_visibility="private")
+            word_box.change(setting("word_check"), inputs=word_box, queue=False, api_visibility="private")
             srt_in.upload(import_srt, inputs=srt_in, outputs=script, api_visibility="private")
             srt_out.click(export_srt, inputs=current, outputs=srt_file, api_visibility="private")
 
@@ -229,10 +236,11 @@ def extended_studio():
                 return (gr.Checkbox(value=long_takes.SETTINGS["ref_unlocked"]), ref_hint(),
                         gr.Checkbox(value=long_takes.SETTINGS["long_retake"]),
                         gr.Checkbox(value=long_takes.SETTINGS["lookahead"]),
-                        gr.Checkbox(value=long_takes.SETTINGS["infill"]))
+                        gr.Checkbox(value=long_takes.SETTINGS["infill"]),
+                        gr.Checkbox(value=long_takes.SETTINGS["word_check"]))
 
             Context.root_block.load(current_settings,
-                                    outputs=[found["unlock"], found["ref_hint"], enabled, lookahead, infill_box],
+                                    outputs=[found["unlock"], found["ref_hint"], enabled, lookahead, infill_box, word_box],
                                     queue=False, api_visibility="private")
             inputs = [script, note, current, enabled]
             for event in (enabled.change, script.change, note.change, current.change):

@@ -32,6 +32,7 @@ import torch
 import chunking
 import infill
 import subtitles
+import word_check
 
 REF_DEFAULT_SECONDS = 20.0
 REF_UNLOCKED_SECONDS = 60.0  # drama3_engine.MAX_REFERENCE_SECONDS
@@ -50,6 +51,8 @@ SETTINGS = {
     "long_retake": _flag("DRAMA3_LONG_RETAKE"),
     "lookahead": os.environ.get("DRAMA3_LOOKAHEAD", "1").strip().lower() in {"1", "true", "yes", "on"},
     "infill": os.environ.get("DRAMA3_INFILL", "1").strip().lower() in {"1", "true", "yes", "on"},
+    # hold each take until its words are checked (word_check.py); off: takes stream
+    "word_check": _flag("DRAMA3_WORD_CHECK"),
 }
 # Drama 3's streaming-input format (technical report, Figure 10): each chunk's turn also
 # shows the chunk that follows, after <|endofturn|>, so the model voices the current
@@ -96,6 +99,11 @@ def parse_retake(text: str) -> tuple[str | None, str]:
 def directed_turn(direction: str | None, text: str) -> str:
     """One chunk of a user-directed Line, under the take's Direction."""
     return f"Direction: {direction}\nLine: {text}" if direction else text
+
+
+def prefixed_turn(direction: str, text: str) -> str:
+    """A user's Direction as a [style prefix] (a first take; see needs_prefix)."""
+    return f"[{direction}] {text}"
 
 
 def retake_turn(note: str, words: str) -> str:
@@ -284,22 +292,154 @@ def make_engine(base):
             except de.RequestError as error:
                 yield {"type": "error", "message": f"Drama 3 request: {error}"}
                 return
-            if plan is None:  # one chunk: the Space's own path, unchanged
+            if plan is None:  # one chunk: the Space's own path
+                _, direction, words = parse_turn(request.text)
+                if self.needs_prefix(request, direction):
+                    body = dict(body, input=prefixed_turn(direction, words))
+                check = word_check.checker(words, request.max_new_tokens)
+                if check is not None and SETTINGS["word_check"]:
+                    yield from self.checked_speech(body, deadline, request, check, direction, words)
+                    return
+                base_speech = super().speech
+                events = (self.opening_checked(lambda: base_speech(body, deadline=deadline), check)
+                          if check is not None and word_check.OPENING else base_speech(body, deadline=deadline))
                 pcm = bytearray()
-                for event in super().speech(body, deadline=deadline):
+                for event in events:
                     if event["type"] == "speech.audio.delta":
                         pcm += event["pcm"]
                     elif event["type"] == "speech.audio.done" and event.get("frames"):
+                        codes = self.last_codes(event["frames"])
+                        if check is not None and word_check.ENDING:
+                            rest = yield from self.finish_line(request, body["input"], direction, check,
+                                                               bytes(pcm), codes, event)
+                            if rest is not None:
+                                more, more_codes, event = rest
+                                pcm += more
+                                codes = torch.cat((codes, more_codes), dim=1)
                         # kept (codes + audio) so an edit of this line can be infilled
-                        _, direction, words = parse_turn(request.text)
                         remember(request.text, LongTake(line=words, direction=direction, chunks=[
-                            ChunkAudio(words, request.text, self.last_codes(event["frames"]), bytes(pcm))]))
+                            ChunkAudio(words, request.text, codes, bytes(pcm))]))
                     yield event
                 return
             try:
                 yield from self.long_speech(request, *plan)
             except de.RequestError as error:
                 yield {"type": "error", "message": f"Drama 3 request: {error}"}
+
+        # A Direction on a first take ------------------------------------------------
+        #
+        # "Direction: …\nLine: …" is Drama 3's directing format, learned as a conversation
+        # about an earlier take (the Space uses it so for retakes, which send that take as
+        # context). On a first take the model often lost its place in it: "Direction: Donald
+        # Trump is having a chat with Elizabeth Holmes from Theranos\nLine: <whispers>
+        # Okay... Alright... Good chat. </whispers> Are you being real, right now?" read the
+        # direction aloud or skipped the whispered span: right in 1 of 12 takes with a
+        # random voice, 3 of 10 with a clone (tag guidance on). A first take is therefore
+        # sent as the line under a [style prefix], which Drama 3 never voices: 12 of 12 and
+        # 9 of 10 right (with the word check), the span whispered and the rest voiced. The
+        # take keeps its own text everywhere else (history, retakes, edits).
+
+        def needs_prefix(self, request, direction) -> bool:
+            return direction is not None and not request.history and request.character is None
+
+        def opening_checked(self, start, check):
+            """A streamed take whose first word_check.OPENING_S are held (the server holds
+            its first 2.5 s anyway) and checked against the start of the line: started
+            again (at most word_check.RETRIES times) when they do not match, else the rest
+            streams as it is made. start() makes the take's events; its return value (a
+            chunk's frames, reason and audio) is passed on."""
+            need = int(word_check.OPENING_S * 88200)
+            for attempt in range(1 + word_check.RETRIES):
+                events, held, buffered, result, finished = start(), 0, [], None, False
+                try:
+                    while held < need:
+                        event = next(events)
+                        buffered.append(event)
+                        if event["type"] == "speech.audio.delta":
+                            held += len(event["pcm"])
+                        elif event["type"] == "error":
+                            break
+                except StopIteration as stop:
+                    result, finished = stop.value, True
+                pcm = b"".join(e["pcm"] for e in buffered if e["type"] == "speech.audio.delta")
+                failed = any(e["type"] == "error" for e in buffered)
+                score = None
+                if not failed and len(pcm) > 0.3 * 88200:
+                    heard = yield from keepalive(check.hear, pcm)
+                    score = check.opening(heard)
+                    word_check.log(f"opening {attempt + 1}: {score if score is None else round(score, 2)} heard "
+                                   f"{word_check.heard_text(heard)[:60]!r}")
+                if not failed and score is not None and score < word_check.OPENING_PASS and attempt < word_check.RETRIES:
+                    events.close()
+                    continue
+                yield from buffered
+                if finished or failed:
+                    events.close()
+                    return result
+                return (yield from events)
+
+        def finish_line(self, request, turn, direction, check, pcm, codes, done):
+            """A streamed take that ended before its last words: those words are made as a
+            continuation (the take so far as history, as a long script's next chunk) and
+            streamed after a pause. Returns (audio, codes, done event) of the addition, or
+            None when the take said everything."""
+            heard = yield from keepalive(check.hear, pcm)
+            tail = word_check.missing_tail(check, heard, stalled=done.get("finish_reason") == "stall")
+            if tail is None:
+                return None
+            word_check.log(f"the take ended before {tail!r}; making the rest")
+            if turn.startswith(de.ENVELOPE_MARKER):
+                turn = request.text
+            rest = (prefixed_turn(direction, tail) if turn.startswith("[") and direction
+                    else directed_turn(direction, tail))
+            rows = self.fit_prompt(rest, self.voices(request, None), [(turn, codes)], request.character)
+            pause = join_pause(word_check.heard_text(heard), pcm)  # the pause after what was said
+            if pause:
+                yield {"type": "speech.audio.delta", "pcm": pause}
+            frames, reason, more = yield from self.generate(rows, request, rest, live=True)
+            if not frames:
+                return None
+            done = dict(done, frames=done["frames"] + frames, finish_reason=reason)
+            return pause + more, self.last_codes(frames), done
+
+        def checked_speech(self, body, deadline, request, check, direction, words):
+            """The Space's path, held until the take is made and its words checked;
+            made again (at most word_check.RETRIES more times) when words are missing,
+            and the best take is sent."""
+            best = None
+            for attempt in range(1 + word_check.RETRIES):
+                pcm, done, beat = bytearray(), None, time.perf_counter()
+                for event in super().speech(body, deadline=deadline):
+                    if event["type"] == "speech.audio.delta":
+                        pcm += event["pcm"]
+                        if time.perf_counter() - beat > KEEPALIVE_S:
+                            beat = time.perf_counter()
+                            yield {"type": "speech.audio.delta", "pcm": b""}
+                    elif event["type"] == "speech.audio.done":
+                        done = event
+                    else:
+                        yield event
+                        return
+                if done is None:
+                    break
+                codes = self.last_codes(done["frames"]) if done.get("frames") else None
+                heard = yield from keepalive(check.hear, bytes(pcm))
+                score = check.score(heard)
+                word_check.log(f"take {attempt + 1}: {score:.2f} heard {word_check.heard_text(heard)[:80]!r}")
+                if best is None or score > best[0]:
+                    best = (score, bytes(pcm), done, codes)
+                if score >= word_check.PASS:
+                    break
+            if best is None:
+                return
+            score, pcm, done, codes = best
+            for offset in range(0, len(pcm), PACKET_BYTES):
+                yield {"type": "speech.audio.delta", "pcm": pcm[offset:offset + PACKET_BYTES]}
+            if codes is not None:
+                # kept (codes + audio) so an edit of this line can be infilled
+                remember(request.text, LongTake(line=words, direction=direction, chunks=[
+                    ChunkAudio(words, request.text, codes, pcm)]))
+            yield done
 
         # Planning ---------------------------------------------------------------
 
@@ -454,6 +594,8 @@ def make_engine(base):
         def long_speech(self, request, note, words, planned, previous):
             started = time.perf_counter()
             voices = self.voices(request, previous)
+            direction = parse_turn(request.text)[1]
+            prefix = previous is None and self.needs_prefix(request, direction)
             # Earlier short takes the server sends (a fresh long line retaken from a short take)
             extra = []
             if previous is None:
@@ -463,7 +605,6 @@ def make_engine(base):
             log(f"{len(planned)} chunks, {regenerate} to generate"
                 + (f", {len(planned) - regenerate} kept" if previous is not None else "")
                 + (f", note “{note}”" if note else ""))
-            direction = parse_turn(request.text)[1]
             records: list[ChunkAudio] = []
             frames_total, finish, first_audio = 0, "stop", None
             timed = subtitles.is_timed(words)
@@ -494,7 +635,8 @@ def make_engine(base):
                         yield {"type": "speech.audio.delta", "pcm": record.pcm[offset:offset + PACKET_BYTES]}
                 else:
                     text = subtitles.spoken_turn(cue) if cue is not None else chunk.text
-                    turn = retake_turn(note, spoken(text) or text) if note else directed_turn(direction, text)
+                    turn = (retake_turn(note, spoken(text) or text) if note
+                            else prefixed_turn(direction, text) if prefix else directed_turn(direction, text))
                     if note and cue is not None and cue.frames:
                         turn += f" [audio tokens: {cue.frames}]"
                     streaming = SETTINGS["lookahead"]
@@ -516,12 +658,34 @@ def make_engine(base):
                     # listener still hears the one before (about 2x real time), so they are
                     # held until complete: a chunk that stalls into a drone is made again
                     # once without any of it having been heard.
-                    live = not records
-                    for attempt in range(1 if live else 2):
-                        frames, reason, pcm = yield from self.generate(rows, request, turn, live=live)
-                        if reason != "stall" or live:
+                    check = word_check.checker(plain(chunk.text))
+                    opening = check if check is not None and not records and word_check.OPENING else None
+                    if not SETTINGS["word_check"]:
+                        check = None
+                    live = not records and check is None
+                    best = None
+                    for attempt in range(1 if live else 1 + max(1, word_check.RETRIES if check else 1)):
+                        if live and opening is not None:
+                            frames, reason, pcm = yield from self.opening_checked(
+                                lambda: self.generate(rows, request, turn, live=True), opening)
+                        else:
+                            frames, reason, pcm = yield from self.generate(rows, request, turn, live=live)
+                        codes = self.last_codes(frames) if frames else None
+                        score = 0.0 if reason == "stall" else 1.0
+                        if check is not None and frames and reason != "stall":
+                            heard = yield from keepalive(check.hear, pcm)
+                            score = check.score(heard)
+                            word_check.log(f"chunk {index + 1} take {attempt + 1}: {score:.2f} heard "
+                                           f"{word_check.heard_text(heard)[:80]!r}")
+                        if best is None or score > best[0]:
+                            best = (score, frames, reason, pcm, codes)
+                        if live or score >= word_check.PASS:
                             break
-                        log(f"chunk {index + 1}: stalled after {len(pcm) / 88200:.1f}s, making it again")
+                        if reason == "stall":
+                            log(f"chunk {index + 1}: stalled after {len(pcm) / 88200:.1f}s, making it again")
+                        if check is None and reason != "stall":
+                            break
+                    _, frames, reason, pcm, codes = best
                     if not live:
                         for offset in range(0, len(pcm), PACKET_BYTES):
                             yield {"type": "speech.audio.delta", "pcm": pcm[offset:offset + PACKET_BYTES]}
@@ -530,7 +694,7 @@ def make_engine(base):
                     if not frames:
                         log(f"chunk {index + 1}: no audio (end of speech at once)")
                         continue
-                    record = ChunkAudio(chunk.text, prompt_turn, self.last_codes(frames), pcm)
+                    record = ChunkAudio(chunk.text, prompt_turn, codes, pcm)
                     lead, tail = edge_silence(pcm)
                     log(f"chunk {index + 1}: {len(pcm) / 88200:.2f}s, silence {lead:.2f}s at the start, "
                         f"{tail:.2f}s at the end, finish {reason}, ends with {chunk.text[-12:]!r}")
