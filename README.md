@@ -160,7 +160,7 @@ The model sometimes loses its place in a line: it skips a span (more often a tag
 
 `Direction: Donald Trump is having a chat with Elizabeth Holmes from Theranos` / `Line: <whispers> Okay... Alright... Good chat. </whispers> Are you being real, right now?`, streamed: complete in 11 of 12 takes with a random voice (1 of 12 before) and 10 of 10 with a clone (3 of 10 before), the span whispered and the rest voiced; first audio after ~1.3-2.9 s with a random voice when no restart is needed.
 
-**Check every word before playing** (Studio checkbox in its own box between Voice and Sampling, off by default; `DRAMA3_WORD_CHECK=1` for the API): each take, and each chunk of a long script, is held until made and its whole transcript compared with the line (below 90 % it is made again, at most twice, and the best is sent). Every word is checked, but a take plays once made instead of streaming.
+**Check every word before playing** (Studio checkbox “Quality Mode”, in its own box between Voice and Sampling, off by default; `DRAMA3_WORD_CHECK=1` for the API): each take, and each chunk of a long script, is held until made and its whole transcript compared with the line (below 90 % it is made again, at most twice, and the best is sent). Every word is checked, but a take plays once made instead of streaming.
 
 ### Voice guidance (with “Check every word before playing”)
 

@@ -12,8 +12,9 @@ is built, without changing the Space's files:
 - In the same card: "Read ahead across chunks" (lookahead), "Edit by infilling", and
   subtitles: import an .srt as a timed script, download the .srt of the current take.
 - A box of its own between the Voice card and Sampling: "Check every word before
-  playing" (word_check.py), and folded under it like Sampling, its "Voice guidance"
-  strength (tag_guidance.py; full model only).
+  playing (Quality Mode)" (word_check.py), and folded under it like Sampling, its
+  "Voice guidance" strength (tag_guidance.py; full model only), greyed out while the
+  check is off.
 """
 
 from __future__ import annotations
@@ -133,14 +134,23 @@ def extended_studio():
     slider_init, button_click = gr.Slider.__init__, gr.Button.click
     accordion_init = gr.Accordion.__init__
 
+    def guidance_classes(checked):
+        return ["voice-guidance"] + ([] if checked else ["voice-guidance-off"])
+
     def word_check_controls():
         """"Check every word" and its voice guidance (folded away, like Sampling)."""
+        # (a folded Accordion's contents are not rendered, so the style is outside it)
+        gr.HTML("<style>.voice-guidance-off { opacity: 0.4; } #voice-guidance-style { display: none; }</style>",
+                padding=False, container=False, elem_id="voice-guidance-style")
         found["word_box"] = gr.Checkbox(
-            value=long_takes.SETTINGS["word_check"], label="Check every word before playing",
-            info="Each take is held until Whisper confirms every word was said, and made again (up to twice) if "
-                 "words are missing or a direction was read aloud. Takes then play once made instead of "
-                 "streaming. Off: takes stream, and only their opening is checked.")
-        with gr.Accordion("Voice guidance", open=False, visible=not SMALL):
+            value=long_takes.SETTINGS["word_check"], label="Check every word before playing (Quality Mode)",
+            info="**DISABLES STREAMING AND REAL-TIME GENERATION!** Each take is held until Whisper confirms every "
+                 "word was said, and made again (up to twice) if words are missing or a direction was read aloud. "
+                 "Takes then play once made instead of streaming. Off: takes stream, and only their opening is "
+                 "checked.")
+        with gr.Accordion("Voice guidance", open=False, visible=not SMALL,
+                          elem_classes=guidance_classes(long_takes.SETTINGS["word_check"])) as box:
+            found["guidance_box"] = box
             found["voice_slider"] = gr.Slider(
                 0, 3, value=long_takes.SETTINGS["voice_guidance"], step=0.5, label="Voice guidance",
                 show_label=False,
@@ -244,6 +254,13 @@ def extended_studio():
             infill_box.change(setting("infill"), inputs=infill_box, queue=False, api_visibility="private")
             word_box.change(setting("word_check"), inputs=word_box, queue=False, api_visibility="private")
 
+            def guidance_state(checked):  # greyed out while the word check is off: it does nothing then
+                return (gr.Accordion(elem_classes=guidance_classes(checked)),
+                        gr.Slider(interactive=bool(checked)))
+
+            guidance = [found["guidance_box"], voice_slider]
+            word_box.change(guidance_state, inputs=word_box, outputs=guidance, queue=False, api_visibility="private")
+
             def set_voice_guidance(value):
                 long_takes.SETTINGS["voice_guidance"] = float(value)
 
@@ -273,6 +290,8 @@ def extended_studio():
             Context.root_block.load(current_settings,
                                     outputs=[found["unlock"], found["ref_hint"], enabled, lookahead, infill_box, word_box,
                                              voice_slider],
+                                    queue=False, api_visibility="private")
+            Context.root_block.load(lambda: guidance_state(long_takes.SETTINGS["word_check"]), outputs=guidance,
                                     queue=False, api_visibility="private")
             inputs = [script, note, current, enabled]
             for event in (enabled.change, script.change, note.change, current.change):
