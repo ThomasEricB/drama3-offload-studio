@@ -244,6 +244,8 @@ In their 500-clip test both had the same failure and word error rates as unquant
 > [!WARNING]
 > **Untested on a Mac, and not yet verified to produce a complete take.** On Linux, MLX's CPU and CUDA builds load both models through this engine and generate frames, but too slowly to finish a take there. Please report how it behaves.
 
+On one user's Mac, the MLX 4-bit model loaded and the Studio started once scipy's macOS 12 build replaced its macOS 14 one, whose library that Mac refused to load; Install (and Update) now installs that build on macOS.
+
 `offload/drama3_mlx.py` swaps only the model and codec; the Space's prompts, server and UI, and this Studio's pause fix, stall guard, long takes, infill edits and subtitles are meant to work as on NVIDIA.
 
 **Eager fallback.** **Start (24+ GB VRAM)** on a Mac runs `offload/drama3_portable.py`, an eager engine on the Apple GPU (MPS) for the official checkpoint, without CUDA graphs or compile. MPS has no FP8 type, so the experts stay as raw bytes (30 GiB) and are converted per token, bit-identically to fish-speech's own dequantization; weights take about 40 GB of unified memory. Verified on Linux with CUDA hidden: Clone, Design, Surprise and a retake with a note came back as the right words. It has not run on a Mac; speed there is unknown and probably below real time.

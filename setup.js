@@ -67,6 +67,22 @@ module.exports = {
         ]
       }
     },
+    // scipy 1.15.3 (the last for Python 3.10) has a macOS 14 arm64 wheel that macOS refused to load on a
+    // user's Mac ("_spropack...so: section '__DATA/__thread_bss' has a zero-fill section type, but offset
+    // field is not zero"), so mlx-audio's import of scipy stopped Start; the macOS 12 wheel of the same
+    // version loads. uv picks a wheel for the running macOS unless told the platform: 12.0 rules out the 14.0 one.
+    {
+      when: "{{platform === 'darwin'}}",
+      method: "shell.run",
+      params: {
+        venv: "env",
+        path: "app",
+        env: { MACOSX_DEPLOYMENT_TARGET: "12.0" },
+        message: [
+          "uv pip install --reinstall-package scipy --no-deps --python-platform aarch64-apple-darwin scipy==1.15.3"
+        ]
+      }
+    },
     // The pause fix's silence codes (813 bytes), published with drama3-small: codec codes, so
     // they apply to both models (same codec)
     {
