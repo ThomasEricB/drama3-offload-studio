@@ -53,6 +53,8 @@ SETTINGS = {
     "infill": os.environ.get("DRAMA3_INFILL", "1").strip().lower() in {"1", "true", "yes", "on"},
     # hold each take until its words are checked (word_check.py); off: takes stream
     "word_check": _flag("DRAMA3_WORD_CHECK"),
+    # those held takes' voice guidance (tag_guidance.py; 0 = off): the Studio's slider
+    "voice_guidance": float(os.environ.get("DRAMA3_VOICE_GUIDANCE", "2")),
 }
 # Drama 3's streaming-input format (technical report, Figure 10): each chunk's turn also
 # shows the chunk that follows, after <|endofturn|>, so the model voices the current
@@ -245,6 +247,39 @@ def room_tone(pcms: list[bytes], samples: int) -> bytes:
     return (np.clip(shaped, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
 
 
+# A held take that runs on after its last word (voice guidance copies a clip's music bed,
+# and twice in 48 takes the bed went on for 17 s after the line) is cut TAIL_KEEP_S after
+# the last word Whisper places, when more than TAIL_MAX_S follow it. Not when the line's
+# last word was not heard (it may be whispered) or the script ends on a [cue] (a laugh or
+# a sigh is not a word Whisper places). Over 358 test takes the runaways left 5-17 s;
+# with clean clips no take had more than 2.7 s, often a voiced breath or hum, kept.
+TAIL_KEEP_S = 0.4
+TAIL_MAX_S = 4.0  # as the server's stall limit
+TAIL_FADE_S = 0.05
+ENDS_ON_CUE = re.compile(r"\[[^\[\]]*\]\s*$")
+
+
+def trim_tail(script: str, heard: list, pcm: bytes, codes):
+    """(pcm, codes) of a held take without what runs on after its last word."""
+    import numpy as np
+
+    if not heard or ENDS_ON_CUE.search(script):
+        return pcm, codes
+    words = infill.align(script, heard)
+    if not words or not words[-1].heard or words[-1].end is None:
+        return pcm, codes
+    keep = words[-1].end + TAIL_KEEP_S
+    if len(pcm) / 88200 - keep <= TAIL_MAX_S:
+        return pcm, codes
+    samples = np.frombuffer(pcm[: int(keep * 44100) * 2], dtype="<i2").astype(np.float32)
+    fade = min(int(TAIL_FADE_S * 44100), len(samples))
+    samples[len(samples) - fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
+    log(f"cut {len(pcm) / 88200 - keep:.1f}s after the last word ({words[-1].text!r} ends at {words[-1].end:.1f}s)")
+    if codes is not None:
+        codes = codes[:, : min(codes.shape[1], int(np.ceil(keep * infill.FPS)))]
+    return samples.astype("<i2").tobytes(), codes
+
+
 def keepalive(fn, *args):
     """fn(*args) in a worker thread, sending empty audio packets meanwhile: the server
     ends a take that sends nothing for 15 s (CPU Whisper on a long chunk can take that)."""
@@ -339,6 +374,21 @@ def make_engine(base):
         # 9 of 10 right (with the word check), the span whispered and the rest voiced. The
         # take keeps its own text everywhere else (history, retakes, edits).
 
+        def voice_guided(self, events, request):
+            """events of a take the word check holds, made with voice guidance
+            (tag_guidance.py) at the Studio's strength. Not for a Surprise / Design retake:
+            its voice reference is an earlier take, which its history holds too, so the
+            prompt without the reference differs little, and guidance on that difference
+            ended the line after its first sentence (6 of 8 takes; unguided 1 of 4)."""
+            own = request.voice_count and any(
+                spoken(request.references[0].get("text") or "") == spoken(parse_turn(turn)[2])
+                for turn in request.history)
+            self.voice_weight = 0.0 if own else SETTINGS["voice_guidance"]
+            try:
+                return (yield from events)
+            finally:
+                self.voice_weight = 0.0
+
         def needs_prefix(self, request, direction) -> bool:
             return direction is not None and not request.history and request.character is None
 
@@ -409,7 +459,7 @@ def make_engine(base):
             best = None
             for attempt in range(1 + word_check.RETRIES):
                 pcm, done, beat = bytearray(), None, time.perf_counter()
-                for event in super().speech(body, deadline=deadline):
+                for event in self.voice_guided(super().speech(body, deadline=deadline), request):
                     if event["type"] == "speech.audio.delta":
                         pcm += event["pcm"]
                         if time.perf_counter() - beat > KEEPALIVE_S:
@@ -427,12 +477,15 @@ def make_engine(base):
                 score = check.score(heard)
                 word_check.log(f"take {attempt + 1}: {score:.2f} heard {word_check.heard_text(heard)[:80]!r}")
                 if best is None or score > best[0]:
-                    best = (score, bytes(pcm), done, codes)
+                    best = (score, bytes(pcm), done, codes, heard)
                 if score >= word_check.PASS:
                     break
             if best is None:
                 return
-            score, pcm, done, codes = best
+            score, pcm, done, codes, heard = best
+            pcm, codes = trim_tail(words, heard, pcm, codes)
+            if codes is not None:
+                done = dict(done, frames=codes.shape[1])
             for offset in range(0, len(pcm), PACKET_BYTES):
                 yield {"type": "speech.audio.delta", "pcm": pcm[offset:offset + PACKET_BYTES]}
             if codes is not None:
@@ -668,24 +721,30 @@ def make_engine(base):
                         if live and opening is not None:
                             frames, reason, pcm = yield from self.opening_checked(
                                 lambda: self.generate(rows, request, turn, live=True), opening)
+                        elif check is not None:  # held and checked: voice guidance
+                            frames, reason, pcm = yield from self.voice_guided(
+                                self.generate(rows, request, turn, live=live), request)
                         else:
                             frames, reason, pcm = yield from self.generate(rows, request, turn, live=live)
                         codes = self.last_codes(frames) if frames else None
-                        score = 0.0 if reason == "stall" else 1.0
+                        score, heard = (0.0 if reason == "stall" else 1.0), None
                         if check is not None and frames and reason != "stall":
                             heard = yield from keepalive(check.hear, pcm)
                             score = check.score(heard)
                             word_check.log(f"chunk {index + 1} take {attempt + 1}: {score:.2f} heard "
                                            f"{word_check.heard_text(heard)[:80]!r}")
                         if best is None or score > best[0]:
-                            best = (score, frames, reason, pcm, codes)
+                            best = (score, frames, reason, pcm, codes, heard)
                         if live or score >= word_check.PASS:
                             break
                         if reason == "stall":
                             log(f"chunk {index + 1}: stalled after {len(pcm) / 88200:.1f}s, making it again")
                         if check is None and reason != "stall":
                             break
-                    _, frames, reason, pcm, codes = best
+                    _, frames, reason, pcm, codes, heard = best
+                    if check is not None and frames:
+                        pcm, codes = trim_tail(plain(chunk.text), heard, pcm, codes)
+                        frames = codes.shape[1]
                     if not live:
                         for offset in range(0, len(pcm), PACKET_BYTES):
                             yield {"type": "speech.audio.delta", "pcm": pcm[offset:offset + PACKET_BYTES]}

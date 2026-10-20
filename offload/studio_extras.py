@@ -10,7 +10,8 @@ is built, without changing the Space's files:
 - The script's character counter shows the chunk count instead of "/ 600", and the
   language / duration hints.
 - In the same card: "Read ahead across chunks" (lookahead), "Edit by infilling", "Check
-  every word before playing" (word_check.py), and
+  every word before playing" (word_check.py) with its "Voice guidance" strength
+  (tag_guidance.py; full model only), and
   subtitles: import an .srt as a timed script, download the .srt of the current take.
 """
 
@@ -204,6 +205,11 @@ def extended_studio():
                                             "again (up to twice) if words are missing or a direction was read aloud. "
                                             "Takes then play once made instead of streaming. Off: takes stream, and "
                                             "only their opening is checked.")
+                voice_slider = gr.Slider(0, 3, value=long_takes.SETTINGS["voice_guidance"], step=0.5,
+                                         label="Voice guidance", visible=not SMALL,
+                                         info="With “Check every word” on: a cloned voice (and its Retakes) is made "
+                                              "closer to its clip, at about 1.5x the time. 2 measured best; 0 = off. "
+                                              "A clip's background music is copied more too.")
                 with gr.Row():
                     srt_in = gr.UploadButton("Import subtitles (.srt)", file_types=[".srt"], size="sm")
                     srt_out = gr.Button("Subtitles of this take (.srt)", size="sm")
@@ -218,6 +224,11 @@ def extended_studio():
             lookahead.change(setting("lookahead"), inputs=lookahead, queue=False, api_visibility="private")
             infill_box.change(setting("infill"), inputs=infill_box, queue=False, api_visibility="private")
             word_box.change(setting("word_check"), inputs=word_box, queue=False, api_visibility="private")
+
+            def set_voice_guidance(value):
+                long_takes.SETTINGS["voice_guidance"] = float(value)
+
+            voice_slider.change(set_voice_guidance, inputs=voice_slider, queue=False, api_visibility="private")
             srt_in.upload(import_srt, inputs=srt_in, outputs=script, api_visibility="private")
             srt_out.click(export_srt, inputs=current, outputs=srt_file, api_visibility="private")
 
@@ -237,10 +248,12 @@ def extended_studio():
                         gr.Checkbox(value=long_takes.SETTINGS["long_retake"]),
                         gr.Checkbox(value=long_takes.SETTINGS["lookahead"]),
                         gr.Checkbox(value=long_takes.SETTINGS["infill"]),
-                        gr.Checkbox(value=long_takes.SETTINGS["word_check"]))
+                        gr.Checkbox(value=long_takes.SETTINGS["word_check"]),
+                        gr.Slider(value=long_takes.SETTINGS["voice_guidance"]))
 
             Context.root_block.load(current_settings,
-                                    outputs=[found["unlock"], found["ref_hint"], enabled, lookahead, infill_box, word_box],
+                                    outputs=[found["unlock"], found["ref_hint"], enabled, lookahead, infill_box, word_box,
+                                             voice_slider],
                                     queue=False, api_visibility="private")
             inputs = [script, note, current, enabled]
             for event in (enabled.change, script.change, note.change, current.change):

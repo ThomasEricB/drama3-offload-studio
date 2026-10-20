@@ -162,6 +162,15 @@ The model sometimes loses its place in a line: it skips a span (more often a tag
 
 **Check every word before playing** (Studio checkbox under the stage, off by default; `DRAMA3_WORD_CHECK=1` for the API): each take, and each chunk of a long script, is held until made and its whole transcript compared with the line (below 90 % it is made again, at most twice, and the best is sent). Every word is checked, but a take plays once made instead of streaming.
 
+### Voice guidance (with “Check every word before playing”)
+
+Since those takes are not streamed, they can afford a slower, closer clone. On NVIDIA (full model), `offload/tag_guidance.py` guides a cloned voice towards its clip the way tag guidance does for `<tags>`: each step also runs the prompt **without** its reference clip (the prompt Drama 3 uses for a voice of its own) and pushes the next frame away from it, at strength 2 (the **Voice guidance** slider under the checkbox, 0-3; `DRAMA3_VOICE_GUIDANCE` for the API; 0 = off). This is the "keep the text, drop the voice prompt" form of classifier-free guidance (Selective CFG, arXiv 2509.19668); 2 measured best (1 and 3 were tried), as in SemBridge (arXiv 2608.07462).
+- **Measured** on two clean Trump clips through the Studio path (16 takes per voice and setting, 4 lines in English and Portuguese): speaker similarity (ECAPA) 0.445 to 0.583 and 0.616 to 0.680; on a Trump recording the model never saw, 0.476 to 0.590; a second speaker model (x-vector) +0.020 and +0.002; median pitch 5.0 to 3.1 and 1.6 to 1.2 semitones from the clip's. Every word kept.
+- **Tags too:** a line with `<tags>` gets both guidances (three rows per step); the Holmes line's `<whispers>` span stayed whispered in 6 of 6 takes, the rest voiced.
+- **Long scripts and clone retakes** are guided chunk by chunk / take by take. **Surprise and Design retakes are not:** their voice reference is the earlier take, which their history holds too, and guidance on that small difference ended the line after its first sentence (6 of 8 takes; 1 of 4 unguided).
+- **The clip's background comes along:** a clip with music under the voice gets that music louder in its takes, and twice in 48 takes it ran on for 17 s after the line. A held take with more than 4 s after its last word (as Whisper places it) is cut 0.4 s after it; in 358 test takes that cut only such runaways (5-17 s), never a word. A clean clip works best.
+- **Cost:** about 1.5x the time per take (a short line ~5.5 s instead of ~3.8 s; a 40 s script 46 s instead of 21 s). A tagged line with voice guidance allocates a three-row cache set on first use (0.77 GiB, kept). Streamed takes and takes with the slider at 0 run exactly as before (seeded takes are sample-identical).
+
 ### 20 s and 60 s references
 
 60 s references need about 2.2 GiB more working memory, so the expert split follows the **voice each take uses**: on the 5090, the 4,157 most-used experts stay on the GPU for takes with a voice of 20 s or less, and 3,144 for takes with a longer clone voice.
