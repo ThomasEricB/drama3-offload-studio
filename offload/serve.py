@@ -127,6 +127,7 @@ import branding  # noqa: E402
 import long_takes  # noqa: E402
 import pause_fix  # noqa: E402
 import studio_extras  # noqa: E402
+import tag_guidance  # noqa: E402
 
 # The drama3-small pause fix, for the full model too: silence is masked from the next draw
 # after DRAMA3_MAX_PAUSE_FRAMES silent frames, and a length guard ends takes that never stop
@@ -141,6 +142,10 @@ if not PREVIEW:
               f"{pause_fix.MAX_PAUSE_FRAMES} frames", flush=True)
     else:
         print("[pause] pause fix off: silence codes not found (run Install)", flush=True)
+    if backend == "cuda":
+        # <tags> are followed even against a cloned voice's delivery (guidance on the markup);
+        # not yet measured with drama3-small
+        tag_guidance.install()
 
 # Long scripts are chunked inside the engine (wraps whichever Engine the backend set up)
 long_takes.install_engine()

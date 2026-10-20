@@ -106,38 +106,57 @@ def install(silence_codes_path: str) -> None:
             self.pause_lookup = lookup.to(device)
             self.silent_run = torch.zeros(1, dtype=torch.long, device=device)
             self.silent_window = torch.zeros(PAUSE_WINDOW, dtype=torch.long, device=device)
+            self.silence_window = torch.zeros(PAUSE_WINDOW, dtype=torch.long, device=device)
+            # Read when a graph is captured: "quiet" counts the silence and quiet codes in the
+            # window; "silence" only the silence codes (tag_guidance's graphs: a whisper is
+            # largely quiet codes, while the pauses that stall are mostly silence codes)
+            self.window_rule = "quiet"
             self.status = torch.zeros(3, dtype=torch.long, device=device)  # main, finite, silent run
 
         def run(self, kv_len: int) -> None:
             backbone, tower = self.model.backbone, self.model.audio_decoder
-            logits = F.linear(self.hidden, self.candidate_head)
+            logits = self.main_logits()
             finite = torch.isfinite(logits).all()
             if MAX_PAUSE_FRAMES > 0:
-                clamp = ((self.silence_candidates & (self.silent_run >= MAX_PAUSE_FRAMES))
-                         | (self.pause_candidates & (self.silent_window.sum() >= PAUSE_WINDOW_MAX)))
+                clamp = self.silence_candidates & (self.silent_run >= MAX_PAUSE_FRAMES)
+                if self.window_rule == "quiet":
+                    clamp = clamp | (self.pause_candidates & (self.silent_window.sum() >= PAUSE_WINDOW_MAX))
+                elif self.window_rule == "silence":
+                    clamp = clamp | (self.silence_candidates & (self.silence_window.sum() >= PAUSE_WINDOW_MAX))
                 logits = logits.masked_fill(clamp, float("-inf"))
             sampled = de.decode_candidates(
                 tower, self.candidate_ids, logits, self.hidden, self.position, self.frame, self.history,
                 temperature=self.temperature, top_k=self.top_k, top_p=self.top_p,
             )
             embeddings = tower.embed_backbone(sampled, backbone.embed(sampled[:, 0]))
-            hidden = backbone(inputs_embeds=embeddings[None], input_pos=self.position + 1, static_kv_len=kv_len)
+            self.advance(embeddings, kv_len)
             self.out_frames.index_copy_(0, self.out_index.clamp(max=de.MAX_NEW_TOKENS_CAP), sampled)
             silent = self.silence_lookup.index_select(0, sampled[0, 1:2])  # [1], no host sync
             self.silent_run.copy_(torch.where(silent, self.silent_run + 1, torch.zeros_like(self.silent_run)))
             paused = self.pause_lookup.index_select(0, sampled[0, 1:2])
             self.silent_window.copy_(torch.cat((self.silent_window[1:], paused.long())))
+            self.silence_window.copy_(torch.cat((self.silence_window[1:], silent.long())))
             self.status.copy_(torch.stack((sampled[0, 0], finite.long(), self.silent_run[0])))
-            self.hidden.copy_(hidden[0])
             self.frame.copy_(sampled)
             self.history.copy_(torch.cat((self.history[1:], sampled[0, :1])))
             self.position.add_(1)
             self.out_index.add_(1)
 
+        def main_logits(self) -> torch.Tensor:
+            """The main token's logits over the candidates (tag_guidance replaces this)."""
+            return F.linear(self.hidden, self.candidate_head)
+
+        def advance(self, embeddings: torch.Tensor, kv_len: int) -> None:
+            """Feed the sampled frame to the backbone: the next step's hidden state."""
+            hidden = self.model.backbone(inputs_embeds=embeddings[None], input_pos=self.position + 1,
+                                         static_kv_len=kv_len)
+            self.hidden.copy_(hidden[0])
+
         def start(self, hidden, position, prompt_frames, temperature, top_k, top_p) -> None:
             super().start(hidden, position, prompt_frames, temperature, top_k, top_p)
             self.silent_run.zero_()
             self.silent_window.zero_()
+            self.silence_window.zero_()
 
     de.DecodeGraphs = PauseClampGraphs
     base_engine = de.Engine

@@ -124,7 +124,7 @@ The start log reports the split it chose, for example `[offload] ... 0 of 40 lay
 
 ### Pause fix
 
-Drama 3 sometimes goes silent at a tag or sentence boundary and never resumes or stops. The fix published with [drama3-small](https://huggingface.co/pentacoxian-dev/drama3-small-GGUF) (there for audio.cpp) is ported to this Studio's own engine (`offload/pause_fix.py`), for both models, on NVIDIA inside the CUDA-graph decode step and in the experimental Mac engine: after 10 silent frames in a row (0.47 s; a frame is silent when its first audio code is one of the 143 codes in `silence_codes.json`), silence is masked from the next draw, so the model must resume speaking or end; and a length guard estimated from the text ends a take that pauses after twice its expected length, or reaches three times it. Install downloads the 813-byte codes file. Tested on the full model: normal lines, slow "dramatic pauses" retakes and a 72 s long script all kept every word (53/53, 53/53, 196/196). `DRAMA3_MAX_PAUSE_FRAMES` in `start.js` (default `10`; `0` turns it off).
+Drama 3 sometimes goes silent at a tag or sentence boundary and never resumes or stops. The fix published with [drama3-small](https://huggingface.co/pentacoxian-dev/drama3-small-GGUF) (there for audio.cpp) is ported to this Studio's own engine (`offload/pause_fix.py`), for both models, on NVIDIA inside the CUDA-graph decode step and in the experimental Mac engine: after 10 silent frames in a row (0.47 s; a frame is silent when its first audio code is one of the 143 codes in `silence_codes.json`), silence is masked from the next draw, so the model must resume speaking or end; and a length guard estimated from the text ends a take that pauses after twice its expected length, or reaches three times it. The model also pauses in silence codes broken every few frames by a quiet code that is not on the list, which never makes 10 in a row: a pause is therefore also cut when 10 of the last 20 frames are silent or one of 7 such quiet codes (`[clears throat] Senhoras e senhores... [hesitates]` stalled in 7 of 8 takes before, 0 of 8 after; normal speech kept the same words, length and pauses). Install downloads the 813-byte codes file. Tested on the full model: normal lines, slow "dramatic pauses" retakes and a 72 s long script all kept every word (53/53, 53/53, 196/196). `DRAMA3_MAX_PAUSE_FRAMES` in `start.js` (default `10`; `0` turns it off).
 
 ### Stall guard
 
@@ -139,6 +139,16 @@ The limits were fitted on 96 takes of the full model (4 lines x 12 seeds x 2 sam
 - **The 3 derailed takes:** fell to 22-23 and are cut after about 1.5 s of audio instead of 18 s.
 
 The limits were not re-fitted for the Small GGUF. `DRAMA3_STALL_GUARD` in `start.js` (`0` = off).
+
+### Tag guidance (`<whisper>…</whisper>` and every other `<tag>`)
+
+A cloned voice copies the delivery of its reference clip, and a loud, energetic clip can outweigh the script's own tags: `<whisper>…</whisper>` came out voiced in nearly every take with such a clone, while random voices whispered. On NVIDIA (full model), `offload/tag_guidance.py` makes the model follow `<…>` markup anyway:
+- **How:** for a line with `<…>` markup, each decode step runs the line twice in one batch, as written and with its tags blanked, and pushes the next frame further in the direction the tags move it (classifier-free guidance, weight 4). Only audio tokens the tagged line itself finds plausible are boosted, and end of speech is left as the tagged line predicts it, so words are not dropped.
+- **Measured** with a clone that resisted tags (8-12 takes per line): `<whisper>` 0.65 to 0.25 of the audio voiced (English) and 0.21 to 0.06 (Portuguese), every word kept; a whispered span inside a voiced line whispered in 9 of 10 takes instead of 2; `<crying>` pitch 234 to 298 Hz; `<shouting>` 261 Hz against 217 Hz untagged.
+- **Only cloned voices:** random and designed voices already follow tags, and guidance there amplified the tags' side effects too (a whispered span after a `Direction:` line was skipped in 10 of 10 takes instead of 4 of 10). With the clone, that same directed line came out complete in 9 of 10 takes instead of 6, the span whispered and the rest voiced.
+- **Cost:** only for lines with `<…>`: about 0.75 s per second of audio on an RTX 5090 instead of 0.5 s, and 0.3 GiB more VRAM. Lines without `<…>` run exactly as before; `[cues]` are not affected.
+
+`DRAMA3_TAG_GUIDANCE` (default `4`; `0` = off). Not yet measured with the Small GGUF, so it is off there.
 
 ### 20 s and 60 s references
 
