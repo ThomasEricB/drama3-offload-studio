@@ -9,6 +9,7 @@ is built, without changing the Space's files:
   how the script will be chunked and which chunks the next Retake / Edit regenerates.
 - The script's character counter shows the chunk count instead of "/ 600", and the
   language / duration hints.
+- The script box's text cursor shows on its highlighted [cues] and <tags> too (EXTRAS_CSS).
 - In the same card: "Read ahead across chunks" (lookahead), "Edit by infilling", and
   subtitles: import an .srt as a timed script, download the .srt of the current take.
 - A box of its own between the Voice card and Sampling: "Check every word before
@@ -38,6 +39,14 @@ UNLOCK_INFO = (
     "you untick. A take with such a voice uses a memory layout with more of the model in RAM (a little slower); "
     "the next take with a shorter voice goes back to the faster one. Switching happens between takes, ~1 s.")
 # drama3-small's recommended sampling (its model card); the Space's are 1.0 / 0.9 / all
+# The script's highlighting is a mirror drawn over the textarea, whose text is transparent:
+# the caret showed only where the mirror is transparent, never on a [cue] or <tag> chip.
+# The textarea goes on top instead, its background transparent so the chips show through.
+EXTRAS_CSS = """
+#studio-extras-style { display: none; }
+.voice-guidance-off { opacity: 0.4; }
+#script textarea.drama-highlighted { position: relative; z-index: 3; background: transparent !important; }
+"""
 SAMPLING_DEFAULTS = {"Temperature": 0.7, "Top-p": 0.7, "Top-k": 30} if SMALL else {}
 NOTE_PLACEHOLDER_SPACE = "e.g. more amused than before; drop the hurt"
 NOTE_PLACEHOLDER = "e.g. more amused than before · or leave empty and edit the script to re-read it"
@@ -140,8 +149,7 @@ def extended_studio():
     def word_check_controls():
         """"Check every word" and its voice guidance (folded away, like Sampling)."""
         # (a folded Accordion's contents are not rendered, so the style is outside it)
-        gr.HTML("<style>.voice-guidance-off { opacity: 0.4; } #voice-guidance-style { display: none; }</style>",
-                padding=False, container=False, elem_id="voice-guidance-style")
+        gr.HTML(f"<style>{EXTRAS_CSS}</style>", padding=False, container=False, elem_id="studio-extras-style")
         found["word_box"] = gr.Checkbox(
             value=long_takes.SETTINGS["word_check"], label="Check every word before playing (Quality Mode)",
             info="**DISABLES STREAMING AND REAL-TIME GENERATION!** Each take is held until Whisper confirms every "
