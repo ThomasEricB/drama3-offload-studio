@@ -3,8 +3,10 @@
 The Space says "running on ZeroGPU" in its header and shows a "ZeroGPU" badge (its
 server reports no local device, because ZeroGPU attaches one per take). Here the model
 runs on this machine, so the header, badge and page titles name the local device and
-the offload split instead. The Space's files are not modified: the header is rewritten
-as the UI reads it, and the badge comes from a replaced server.gpu_info().
+the offload split instead, and the footer says this is an offline version, not endorsed
+nor created by Fish Audio, where the Space's says takes live in its server memory. The
+Space's files are not modified: the header and footer are rewritten as the UI reads
+them, and the badge comes from a replaced server.gpu_info().
 """
 
 from __future__ import annotations
@@ -15,6 +17,8 @@ from pathlib import Path
 
 STUDIO_NAME = "Drama 3 Offload Studio"
 SPACE_TITLE = "Fish Audio Drama 3"
+SPACE_STORAGE = " Takes and uploaded voices live in server memory only and expire."
+OFFLINE_NOTE = " This is an offline version, not endorsed nor created by Fish Audio."
 
 
 def device_name(backend: str) -> str:
@@ -55,8 +59,10 @@ def _full_label(backend: str) -> str:
 
 
 def rebrand_page(text: str, device: str) -> str:
-    """hero.html (Studio) or index.html (/legacy) with the local name and device."""
+    """hero.html and footer.html (Studio) or index.html (/legacy) with the local name and
+    device, and the footer's note on the Space's storage replaced by one on this version."""
     return (text
+            .replace(SPACE_STORAGE, OFFLINE_NOTE)
             .replace("<h1>🎭 Drama 3</h1>", f"<h1>🎭 {STUDIO_NAME}</h1>")
             .replace("by Fish Audio · running on ZeroGPU", f"Model by Fish Audio · running locally on {device}")
             .replace(f"<title>{SPACE_TITLE}</title>", f"<title>{STUDIO_NAME}</title>"))
@@ -64,10 +70,10 @@ def rebrand_page(text: str, device: str) -> str:
 
 @contextlib.contextmanager
 def rebranded_ui(backend: str):
-    """While the Space loads the model and builds its UI: rewrite hero.html as it is
-    read, and rename the Gradio page title. Both patches are removed afterwards. The
-    device label is computed when hero.html is read, after the weights (and so the
-    offload split) are placed."""
+    """While the Space loads the model and builds its UI: rewrite hero.html and
+    footer.html as they are read, and rename the Gradio page title. Both patches are
+    removed afterwards. The device label is computed when hero.html is read, after the
+    weights (and so the offload split) are placed."""
     import gradio as gr
 
     read_text, blocks_init = Path.read_text, gr.Blocks.__init__
@@ -76,7 +82,9 @@ def rebranded_ui(backend: str):
         if not args:  # the Space's files are UTF-8; Windows would read them as cp1252
             kwargs.setdefault("encoding", "utf-8")
         text = read_text(self, *args, **kwargs)
-        return rebrand_page(text, device_name(backend)) if self.name == "hero.html" else text
+        if self.name in ("hero.html", "footer.html"):
+            return rebrand_page(text, device_name(backend))
+        return text
 
     @functools.wraps(blocks_init)
     def patched_blocks_init(self, *args, **kwargs):
