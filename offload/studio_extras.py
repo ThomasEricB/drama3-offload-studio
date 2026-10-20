@@ -9,10 +9,11 @@ is built, without changing the Space's files:
   how the script will be chunked and which chunks the next Retake / Edit regenerates.
 - The script's character counter shows the chunk count instead of "/ 600", and the
   language / duration hints.
-- In the same card: "Read ahead across chunks" (lookahead), "Edit by infilling", "Check
-  every word before playing" (word_check.py) with its "Voice guidance" strength
-  (tag_guidance.py; full model only), and
+- In the same card: "Read ahead across chunks" (lookahead), "Edit by infilling", and
   subtitles: import an .srt as a timed script, download the .srt of the current take.
+- A box of its own between the Voice card and Sampling: "Check every word before
+  playing" (word_check.py), and folded under it like Sampling, its "Voice guidance"
+  strength (tag_guidance.py; full model only).
 """
 
 from __future__ import annotations
@@ -130,6 +131,31 @@ def extended_studio():
         gr.Markdown.__init__, gr.Textbox.__init__, gr.State.__init__, gr.Audio.__init__)
     textbox_input = gr.Textbox.input
     slider_init, button_click = gr.Slider.__init__, gr.Button.click
+    accordion_init = gr.Accordion.__init__
+
+    def word_check_controls():
+        """"Check every word" and its voice guidance (folded away, like Sampling)."""
+        found["word_box"] = gr.Checkbox(
+            value=long_takes.SETTINGS["word_check"], label="Check every word before playing",
+            info="Each take is held until Whisper confirms every word was said, and made again (up to twice) if "
+                 "words are missing or a direction was read aloud. Takes then play once made instead of "
+                 "streaming. Off: takes stream, and only their opening is checked.")
+        with gr.Accordion("Voice guidance", open=False, visible=not SMALL):
+            found["voice_slider"] = gr.Slider(
+                0, 3, value=long_takes.SETTINGS["voice_guidance"], step=0.5, label="Voice guidance",
+                show_label=False,
+                info="With “Check every word” on: a cloned voice (and its Retakes) is made closer to its clip, "
+                     "at about 1.5x the time. 2 measured best; 0 = off. A clip's background music is copied "
+                     "more too.")
+
+    @functools.wraps(accordion_init)
+    def on_accordion(self, *args, **kwargs):
+        label = args[0] if args else kwargs.get("label")
+        if label == "Sampling" and "word_box" not in found:
+            # A box of its own between the Voice card and Sampling
+            with gr.Column(elem_classes="card", elem_id="word-check"):
+                word_check_controls()
+        accordion_init(self, *args, **kwargs)
 
     @functools.wraps(slider_init)
     def on_slider(self, *args, **kwargs):
@@ -200,16 +226,9 @@ def extended_studio():
                 infill_box = gr.Checkbox(value=long_takes.SETTINGS["infill"], label="Edit by infilling",
                                          info="With an empty note, an edit regenerates only the words that changed "
                                               "and keeps the audio around them; large edits redo the chunk.")
-                word_box = gr.Checkbox(value=long_takes.SETTINGS["word_check"], label="Check every word before playing",
-                                       info="Each take is held until Whisper confirms every word was said, and made "
-                                            "again (up to twice) if words are missing or a direction was read aloud. "
-                                            "Takes then play once made instead of streaming. Off: takes stream, and "
-                                            "only their opening is checked.")
-                voice_slider = gr.Slider(0, 3, value=long_takes.SETTINGS["voice_guidance"], step=0.5,
-                                         label="Voice guidance", visible=not SMALL,
-                                         info="With “Check every word” on: a cloned voice (and its Retakes) is made "
-                                              "closer to its clip, at about 1.5x the time. 2 measured best; 0 = off. "
-                                              "A clip's background music is copied more too.")
+                if "word_box" not in found:  # the Space's UI had no Sampling box to put them before
+                    word_check_controls()
+                word_box, voice_slider = found["word_box"], found["voice_slider"]
                 with gr.Row():
                     srt_in = gr.UploadButton("Import subtitles (.srt)", file_types=[".srt"], size="sm")
                     srt_out = gr.Button("Subtitles of this take (.srt)", size="sm")
@@ -262,6 +281,7 @@ def extended_studio():
     gr.Markdown.__init__, gr.Textbox.__init__, gr.State.__init__, gr.Audio.__init__ = (
         on_markdown, on_textbox, on_state, on_audio)
     gr.Textbox.input = on_input
+    gr.Accordion.__init__ = on_accordion
     if SAMPLING_DEFAULTS:
         gr.Slider.__init__, gr.Button.click = on_slider, on_click
     try:
@@ -270,4 +290,5 @@ def extended_studio():
         gr.Markdown.__init__, gr.Textbox.__init__, gr.State.__init__, gr.Audio.__init__ = (
             markdown_init, textbox_init, state_init, audio_init)
         gr.Textbox.input = textbox_input
+        gr.Accordion.__init__ = accordion_init
         gr.Slider.__init__, gr.Button.click = slider_init, button_click
