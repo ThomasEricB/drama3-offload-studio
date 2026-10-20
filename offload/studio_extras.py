@@ -9,6 +9,7 @@ is built, without changing the Space's files:
   how the script will be chunked and which chunks the next Retake / Edit regenerates.
 - The script's character counter shows the chunk count instead of "/ 600", and the
   language / duration hints.
+- The stage's take history: a click on a take's row selects it, without playing it.
 - The script box's text cursor shows on its highlighted [cues] and <tags> too, and stays
   on its words in a script longer than the box (EXTRAS_CSS).
 - In the same card: "Read ahead across chunks" (lookahead), "Edit by infilling", and
@@ -25,6 +26,7 @@ import contextlib
 import functools
 import os
 import sys
+from pathlib import Path
 
 import chunking
 import long_takes
@@ -51,11 +53,56 @@ EXTRAS_CSS = """
 #studio-extras-style { display: none; }
 .voice-guidance-off { opacity: 0.4; }
 #script textarea.drama-highlighted { position: relative; z-index: 3; background: transparent !important; }
+.stage-item[role="button"] { cursor: pointer; }
+.stage-item[role="button"]:hover { border-color: var(--muted); }
+.stage-item.current[role="button"]:hover { border-color: var(--ink); }
 #script textarea.drama-highlighted, .gradio-container .drama-script-mirror {
   scrollbar-gutter: stable; scrollbar-width: thin; }
 .gradio-container .drama-script-mirror {
   left: 0 !important; right: 0 !important; width: auto !important; scrollbar-color: transparent transparent; }
 """
+# The stage's take history (stage.js) selected a take only through its ▶ Play button:
+# a click anywhere on its row selects it now (it becomes the take that Retake, an edit
+# and Keep this voice act on, its line back in the script) without playing it.
+STAGE_PLAY = """    play.addEventListener('click', () => {
+      if (state.busy) return;
+      player.reset(); state.current = take; state.take = take;
+      $('audio').src = take.url; $('audio').hidden = false; show(take); slate();
+      player.ensure(); $('audio').play().catch(() => {});
+      if (take.id && !take.partial) trigger('click', {action: 'select', take_id: take.id});
+    });
+"""
+STAGE_SELECT = """    play.addEventListener('click', event => {
+      event.stopPropagation();
+      if (state.busy) return;
+      player.reset(); state.current = take; state.take = take;
+      $('audio').src = take.url; $('audio').hidden = false; show(take); slate();
+      player.ensure(); $('audio').play().catch(() => {});
+      if (take.id && !take.partial) trigger('click', {action: 'select', take_id: take.id});
+    });
+    const select = () => {
+      if (state.busy || take === state.current) return;
+      player.reset(); state.current = take; state.take = take;
+      $('audio').src = take.url; $('audio').hidden = false; show(take); slate(); syncControls();
+      if (take.id && !take.partial) trigger('click', {action: 'select', take_id: take.id});
+    };
+    item.tabIndex = 0; item.setAttribute('role', 'button');
+    item.title = 'Select this take (Retake, edits and Keep this voice act on it)';
+    item.addEventListener('click', select);
+    item.addEventListener('keydown', event => {
+      if (event.target === item && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); select(); }
+    });
+"""
+
+
+def stage_script(text: str) -> str:
+    """stage.js with selectable take rows (unchanged if the Space's code differs)."""
+    if STAGE_PLAY not in text:
+        print("[studio] take rows: stage.js changed, rows select through ▶ Play only", flush=True)
+        return text
+    return text.replace(STAGE_PLAY, STAGE_SELECT)
+
+
 SAMPLING_DEFAULTS = {"Temperature": 0.7, "Top-p": 0.7, "Top-k": 30} if SMALL else {}
 NOTE_PLACEHOLDER_SPACE = "e.g. more amused than before; drop the hurt"
 NOTE_PLACEHOLDER = "e.g. more amused than before · or leave empty and edit the script to re-read it"
@@ -151,6 +198,12 @@ def extended_studio():
     textbox_input = gr.Textbox.input
     slider_init, button_click = gr.Slider.__init__, gr.Button.click
     accordion_init = gr.Accordion.__init__
+    read_text = Path.read_text
+
+    @functools.wraps(read_text)
+    def on_read_text(self, *args, **kwargs):
+        text = read_text(self, *args, **kwargs)
+        return stage_script(text) if self.name == "stage.js" else text
 
     def guidance_classes(checked):
         return ["voice-guidance"] + ([] if checked else ["voice-guidance-off"])
@@ -318,6 +371,7 @@ def extended_studio():
         on_markdown, on_textbox, on_state, on_audio)
     gr.Textbox.input = on_input
     gr.Accordion.__init__ = on_accordion
+    Path.read_text = on_read_text
     if SAMPLING_DEFAULTS:
         gr.Slider.__init__, gr.Button.click = on_slider, on_click
     try:
@@ -327,4 +381,5 @@ def extended_studio():
             markdown_init, textbox_init, state_init, audio_init)
         gr.Textbox.input = textbox_input
         gr.Accordion.__init__ = accordion_init
+        Path.read_text = read_text
         gr.Slider.__init__, gr.Button.click = slider_init, button_click
