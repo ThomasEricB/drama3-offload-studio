@@ -9,7 +9,7 @@ Run [Fish Audio Drama 3](https://huggingface.co/fishaudio/drama-3) on your own c
 Drama 3 is a 35B-parameter mixture-of-experts text-to-speech model (3B active per token) for expressive, multi-character speech in 80+ languages: clone a voice from a clip, design one from a description, and direct the performance with notes and inline cues such as `[sighs]` or `<whisper>…</whisper>`.
 
 > [!NOTE]
-> This is an unofficial, offline version, not endorsed nor created by Fish Audio. The model weights are under the [Fish Audio Community License](https://huggingface.co/fishaudio/drama-3/blob/main/LICENSE), for research and non-commercial use. Only clone voices you have permission to use.
+> This is an unofficial, offline version, not endorsed nor created by Fish Audio. The model weights are under the [Fish Audio Community License](https://huggingface.co/fishaudio/drama-3/blob/main/LICENSE): free for research, non-commercial use, and commercial use while your annual revenue is under USD 500,000. Larger commercial use, and offering it as a hosted voice service, need a license from Fish Audio. Only clone voices you have permission to use.
 
 ## What this adds to the Space
 
@@ -392,4 +392,11 @@ The Gradio endpoints are also available through `gradio_client` (`Client("http:/
 - fcmeyer for the [MLX conversions](https://huggingface.co/fcmeyer/drama-3-MLX-4bit-HQ), and [mlx-audio](https://github.com/Blaizzy/mlx-audio) for the Drama 3 MLX port.
 - T8star's [ComfyUI-Drama3-T8](https://github.com/T8mars/Comfyui-Drama-3) for the idea behind the stall guard.
 
-The Space code is Apache-2.0. The vendored fish-speech code keeps its own license (`app/fish_speech/LICENSE`). The model weights are under the [Fish Audio Community License](https://huggingface.co/fishaudio/drama-3/blob/main/LICENSE), for research and non-commercial use. This project is not affiliated with, endorsed or created by Fish Audio.
+The Space code is Apache-2.0. The vendored fish-speech code keeps its own license (`app/fish_speech/LICENSE`). The model weights are under the [Fish Audio Community License](https://huggingface.co/fishaudio/drama-3/blob/main/LICENSE), version 1.0:
+
+- **Research and non-commercial use:** free.
+- **Commercial use:** free while the annual revenue of you and your affiliates is under USD 500,000. Producing audio yourself for clients (voiceovers, dubbing, audiobooks) and using it in your own product count; above the threshold, a separate license from Fish Audio is needed.
+- **Hosted services** that let others generate speech or clone voices from their own text or samples need a separate license from Fish Audio, whatever your revenue.
+- **Use restrictions** apply to everyone: no imitating an identifiable person's voice without their consent, no impersonation to deceive, defraud or harass, and no using the model or its output to train other speech models.
+
+Read the [license](https://huggingface.co/fishaudio/drama-3/blob/main/LICENSE) itself for the exact terms. This project is not affiliated with, endorsed or created by Fish Audio.

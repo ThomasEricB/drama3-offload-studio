@@ -4,7 +4,8 @@ The Space says "running on ZeroGPU" in its header and shows a "ZeroGPU" badge (i
 server reports no local device, because ZeroGPU attaches one per take). Here the model
 runs on this machine, so the header, badge and page titles name the local device and
 the offload split instead, and the footer says this is an offline version, not endorsed
-nor created by Fish Audio, where the Space's says takes live in its server memory. The
+nor created by Fish Audio, where the Space's says takes live in its server memory, and
+gives the model license's commercial terms too. The
 Space's files are not modified: the header and footer are rewritten as the UI reads
 them, and the badge comes from a replaced server.gpu_info().
 """
@@ -19,6 +20,12 @@ STUDIO_NAME = "Drama 3 Offload Studio"
 SPACE_TITLE = "Fish Audio Drama 3"
 SPACE_STORAGE = " Takes and uploaded voices live in server memory only and expire."
 OFFLINE_NOTE = " This is an offline version, not endorsed nor created by Fish Audio."
+# The model's license (Fish Audio Community License 1.0, October 2026) also allows commercial use
+# below a revenue threshold, which the Space's footer does not say
+SPACE_LICENSE = "</a>, for research and non-commercial use."
+LICENSE_NOTE = ("</a>: free for research, non-commercial use, and commercial use while your annual revenue "
+                "is under USD 500,000. Larger commercial use, and offering it as a hosted voice service, "
+                "need a license from Fish Audio.")
 
 
 def device_name(backend: str) -> str:
@@ -63,6 +70,7 @@ def rebrand_page(text: str, device: str) -> str:
     device, and the footer's note on the Space's storage replaced by one on this version."""
     return (text
             .replace(SPACE_STORAGE, OFFLINE_NOTE)
+            .replace(SPACE_LICENSE, LICENSE_NOTE)
             .replace("<h1>🎭 Drama 3</h1>", f"<h1>🎭 {STUDIO_NAME}</h1>")
             .replace("by Fish Audio · running on ZeroGPU", f"Model by Fish Audio · running locally on {device}")
             .replace(f"<title>{SPACE_TITLE}</title>", f"<title>{STUDIO_NAME}</title>"))
