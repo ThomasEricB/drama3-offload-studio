@@ -167,6 +167,10 @@ if not PREVIEW and backend in ("cuda", "small"):
     word_check.load_gpu_whisper()  # word / opening checks of streamed takes, without delaying them
 long_takes.install_server(server)  # no script limit, empty-note edits, 20 / 60 s references
 
+import seeds  # noqa: E402
+
+seeds.install_server(server, long_takes.SETTINGS)  # a seed per take: `seed` in the API, the Studio's Seed box
+
 import reference_trim  # noqa: E402
 
 reference_trim.install(server)  # long reference clips are cut at the latest pause before the limit

@@ -18,6 +18,9 @@ is built, without changing the Space's files:
   playing (Quality Mode)" (word_check.py), and folded under it like Sampling, its
   "Voice guidance" strength (tag_guidance.py; full model only), greyed out while the
   check is off.
+- Sampling: the seed (seeds.py), a field that opens empty: a new random seed per take
+  (a Retake keeps its take's); a number in it (typed, the last take's, or a new one) is
+  kept for every take. Each take shows its seed in the stage: a click on it keeps it.
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ from pathlib import Path
 
 import chunking
 import long_takes
+import seeds
 import subtitles
 
 REF_HINT_SPACE = "Clips are trimmed to 20 s and transcribed for you."
@@ -60,6 +64,30 @@ EXTRAS_CSS = """
   scrollbar-gutter: stable; scrollbar-width: thin; }
 .gradio-container .drama-script-mirror {
   left: 0 !important; right: 0 !important; width: auto !important; scrollbar-color: transparent transparent; }
+.stage-seed { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer;
+  text-decoration: underline dotted; text-underline-offset: 2px; }
+.stage-seed:hover { color: var(--ink); }
+#seed-box { display: none !important; }
+#seed-widget .seed-ui { display: grid; gap: 10px; padding: 12px 14px; border: 1px solid var(--border-color-primary);
+  border-radius: var(--radius-lg); background: var(--block-background-fill); color: var(--body-text-color); }
+#seed-widget .seed-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+#seed-widget .seed-text { min-width: 0; }
+#seed-widget .seed-title { display: block; font-weight: 600; }
+#seed-widget .seed-hint { display: block; margin-top: 2px; font-size: 12px; color: var(--body-text-color-subdued); }
+#seed-widget .seed-badge { flex: none; padding: 3px 10px; border: 1px solid var(--border-color-primary);
+  border-radius: 999px; font-size: 12px; color: var(--body-text-color-subdued); white-space: nowrap; }
+#seed-widget .seed-ui[data-mode="fixed"] .seed-badge { background: var(--body-text-color);
+  border-color: var(--body-text-color); color: var(--background-fill-primary); font-weight: 600; }
+#seed-widget .seed-row { display: flex; gap: 6px; align-items: stretch; }
+#seed-widget .seed-value { flex: 1 1 auto; min-width: 0; padding: 6px 10px; border: 1px solid var(--border-color-primary);
+  border-radius: 8px; background: var(--input-background-fill); color: var(--body-text-color);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 15px; letter-spacing: .05em; }
+#seed-widget .seed-value::placeholder { color: var(--body-text-color-subdued); font-family: inherit; letter-spacing: 0; }
+#seed-widget .seed-value:focus { outline: none; border-color: var(--body-text-color-subdued); }
+#seed-widget .seed-act { flex: none; padding: 6px 12px; border: 1px solid var(--border-color-primary); border-radius: 8px;
+  background: none; color: var(--body-text-color); font: inherit; font-size: 12px; cursor: pointer; white-space: nowrap; }
+#seed-widget .seed-act:hover:not(:disabled) { border-color: var(--body-text-color-subdued); }
+#seed-widget .seed-act:disabled { opacity: .4; cursor: default; }
 """
 # The stage's take history (stage.js) selected a take only through its ▶ Play button:
 # a click anywhere on its row selects it now (it becomes the take that Retake, an edit
@@ -95,17 +123,121 @@ STAGE_SELECT = """    play.addEventListener('click', event => {
 """
 
 
+# Each take's seed (every event's "seed", seeds.py, so a stopped take has it too): in
+# its metrics, and in its row
+# as a button that puts it in the Sampling box's Seed field (opening the box first:
+# a folded Accordion's contents are not rendered)
+STAGE_SEED = [
+    ("'trimmed_s', 'finish_reason']) {", "'trimmed_s', 'finish_reason', 'seed']) {"),
+    ("    if (event.ttfa_ms != null) take.metrics.ttfa_ms = event.ttfa_ms;\n",
+     "    if (event.ttfa_ms != null) take.metrics.ttfa_ms = event.ttfa_ms;\n"
+     "    if (event.seed != null) take.metrics.seed = event.seed;\n"),
+    ("  if (m.audio_s != null) add('length', `${m.audio_s.toFixed(1)} s`);\n",
+     "  if (m.audio_s != null) add('length', `${m.audio_s.toFixed(1)} s`);\n"
+     "  if (m.seed != null) add('seed', String(m.seed));\n"),
+    ("function slate() {\n", """const SEED_HINTS = {
+  random: 'Empty: a new random seed every take. Each take shows its own; click one to keep it.',
+  fixed: 'Every take uses this seed: same script, voice and settings, same take. Clear it for random.'};
+const SEED_BADGES = {random: 'Random', fixed: 'Fixed'};
+function seedField() { return document.querySelector('#seed-box input'); }
+function setSeed(value) {
+  const input = seedField(); if (!input) return;
+  input.value = value == null ? '' : String(value);
+  input.dispatchEvent(new Event('input', {bubbles: true}));
+  input.dispatchEvent(new Event('change', {bubbles: true}));
+  seedWidget();
+}
+function lastSeed() {
+  for (let i = state.takes.length - 1; i >= 0; i--) if (state.takes[i].metrics.seed != null) return state.takes[i].metrics.seed;
+  return null;
+}
+function newSeed() { return crypto.getRandomValues(new Uint32Array(1))[0]; }
+function seedWidget() {
+  const ui = document.querySelector('#seed-widget .seed-ui'), input = seedField();
+  if (!ui || !input) return;
+  const value = ui.querySelector('.seed-value');
+  if (!ui.dataset.bound) {
+    ui.dataset.bound = '1';
+    ui.querySelector('[data-act="last"]').addEventListener('click', () => { const s = lastSeed(); if (s != null) setSeed(s); });
+    ui.querySelector('[data-act="new"]').addEventListener('click', () => setSeed(newSeed()));
+    ui.querySelector('[data-act="clear"]').addEventListener('click', () => setSeed(null));
+    value.addEventListener('input', () => { value.value = value.value.replace(/\\D/g, '').slice(0, 10); });
+    const commit = () => {  // empty: random; a number over the range is not taken
+      const n = Number(value.value);
+      if (value.value === '') setSeed(null); else if (n <= 4294967295) setSeed(n); else seedWidget();
+    };
+    value.addEventListener('change', commit);
+    value.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); value.blur(); } });
+  }
+  const seed = input.value.trim(), mode = seed === '' ? 'random' : 'fixed';
+  ui.dataset.mode = mode;
+  ui.querySelector('.seed-badge').textContent = SEED_BADGES[mode];
+  ui.querySelector('.seed-hint').textContent = SEED_HINTS[mode];
+  if (document.activeElement !== value) value.value = seed;
+  const last = lastSeed();
+  ui.querySelector('[data-act="last"]').disabled = last == null || String(last) === seed;
+  ui.querySelector('[data-act="clear"]').disabled = seed === '';
+}
+setInterval(seedWidget, 400);  // the Sampling box renders its contents only when opened
+function useSeed(value) {
+  if (!seedField()) {
+    [...document.querySelectorAll('button.label-wrap')].find(b => b.textContent.trim().startsWith('Sampling'))?.click();
+  }
+  let tries = 0;
+  const fill = () => {
+    if (!seedField()) { if (++tries < 40) setTimeout(fill, 50); return; }
+    setSeed(value);
+    document.querySelector('#seed-widget')?.scrollIntoView({block: 'nearest', behavior: 'smooth'});
+  };
+  fill();
+}
+function slate() {
+"""),
+    ("    body.append(title, sub);\n", """    if (take.metrics.seed != null) {
+      const seed = document.createElement('button'); seed.type = 'button'; seed.className = 'stage-seed';
+      seed.textContent = `seed ${take.metrics.seed}`; seed.title = 'Use this seed for the next take (Sampling → Seed)';
+      seed.addEventListener('click', event => { event.stopPropagation(); useSeed(take.metrics.seed); });
+      sub.append(' · ', seed);
+    }
+    body.append(title, sub);
+"""),
+]
+
+
 def stage_script(text: str) -> str:
-    """stage.js with selectable take rows (unchanged if the Space's code differs)."""
-    if STAGE_PLAY not in text:
+    """stage.js with selectable take rows and take seeds (each part left out, with a
+    note, if the Space's code differs)."""
+    if STAGE_PLAY in text:
+        text = text.replace(STAGE_PLAY, STAGE_SELECT)
+    else:
         print("[studio] take rows: stage.js changed, rows select through ▶ Play only", flush=True)
-        return text
-    return text.replace(STAGE_PLAY, STAGE_SELECT)
+    if all(text.count(old) == 1 for old, _ in STAGE_SEED):
+        for old, new in STAGE_SEED:
+            text = text.replace(old, new)
+    else:
+        print("[studio] take seeds: stage.js changed, takes do not show their seed", flush=True)
+    return text
 
 
 SAMPLING_DEFAULTS = {"Temperature": 0.7, "Top-p": 0.7, "Top-k": 30} if SMALL else {}
 NOTE_PLACEHOLDER_SPACE = "e.g. more amused than before; drop the hurt"
 NOTE_PLACEHOLDER = "e.g. more amused than before · or leave empty and edit the script to re-read it"
+# The seed control: a field that starts empty (a new random seed every take); a number in
+# it is kept for every take (typed, the last take's, or a new one). stage.js (STAGE_SEED)
+# wires it to the hidden #seed-box field
+SEED_WIDGET = """<div class="seed-ui" data-mode="random">
+  <div class="seed-head">
+    <div class="seed-text"><span class="seed-title">Seed</span><span class="seed-hint"></span></div>
+    <span class="seed-badge"></span>
+  </div>
+  <div class="seed-row">
+    <input class="seed-value" placeholder="Random" inputmode="numeric" autocomplete="off" spellcheck="false"
+           aria-label="Seed (empty: a random seed every take)">
+    <button type="button" class="seed-act" data-act="last" title="The seed of your latest take">↺ Last take</button>
+    <button type="button" class="seed-act" data-act="new" title="A fresh random seed, kept for every take">🎲 New</button>
+    <button type="button" class="seed-act" data-act="clear" title="Empty: a new random seed every take">✕ Clear</button>
+  </div>
+</div>"""
 
 
 def server():
@@ -237,6 +369,27 @@ def extended_studio():
                 word_check_controls()
         accordion_init(self, *args, **kwargs)
 
+    def seed_controls():
+        """The seed, in Sampling after Top-k (seeds.py): the SEED_WIDGET control (driven by
+        stage.js, STAGE_SEED) over a hidden number field that holds the setting (empty:
+        a random seed per take)."""
+        from gradio.context import Context
+
+        gr.HTML(SEED_WIDGET, elem_id="seed-widget", padding=False)
+        seed = gr.Number(value=long_takes.SETTINGS["seed"], label="Seed", precision=0, minimum=0,
+                         maximum=seeds.SEED_LIMIT - 1, elem_id="seed-box")
+        found["seed"] = seed
+
+        def set_seed(value):
+            long_takes.SETTINGS["seed"] = seeds.checked(value)
+
+        seed.change(set_seed, inputs=seed, queue=False, api_visibility="private")
+        def fresh():  # a page always opens with the field empty: a random seed per take
+            long_takes.SETTINGS["seed"] = None
+            return gr.Number(value=None)
+
+        Context.root_block.load(fresh, outputs=seed, queue=False, api_visibility="private")
+
     @functools.wraps(slider_init)
     def on_slider(self, *args, **kwargs):
         if kwargs.get("label") in SAMPLING_DEFAULTS:
@@ -245,6 +398,8 @@ def extended_studio():
             else:
                 kwargs["value"] = SAMPLING_DEFAULTS[kwargs["label"]]
         slider_init(self, *args, **kwargs)
+        if kwargs.get("label") == "Top-k" and "seed" not in found:
+            seed_controls()
 
     @functools.wraps(button_click)
     def on_click(self, fn=None, *args, **kwargs):
@@ -303,6 +458,10 @@ def extended_studio():
                 lookahead = gr.Checkbox(value=long_takes.SETTINGS["lookahead"], label="Read ahead across chunks",
                                         info="Each chunk of a long script is voiced knowing the next one (Drama 3's "
                                              "streaming-input format), for smoother joins.")
+                tidy_box = gr.Checkbox(value=long_takes.SETTINGS["tail_tidy"], label="Trim chunk tails",
+                                       info="Quality Mode: each chunk fades out 0.2 s after its last word and the "
+                                            "join is silent, dropping the hiss the model trails. Off keeps every "
+                                            "chunk as made, breaths and soft word endings included.")
                 infill_box = gr.Checkbox(value=long_takes.SETTINGS["infill"], label="Edit by infilling",
                                          info="With an empty note, an edit regenerates only the words that changed "
                                               "and keeps the audio around them; large edits redo the chunk.")
@@ -322,6 +481,7 @@ def extended_studio():
 
             lookahead.change(setting("lookahead"), inputs=lookahead, queue=False, api_visibility="private")
             infill_box.change(setting("infill"), inputs=infill_box, queue=False, api_visibility="private")
+            tidy_box.change(setting("tail_tidy"), inputs=tidy_box, queue=False, api_visibility="private")
             word_box.change(setting("word_check"), inputs=word_box, queue=False, api_visibility="private")
 
             def guidance_state(checked):  # greyed out while the word check is off: it does nothing then
@@ -354,12 +514,13 @@ def extended_studio():
                         gr.Checkbox(value=long_takes.SETTINGS["long_retake"]),
                         gr.Checkbox(value=long_takes.SETTINGS["lookahead"]),
                         gr.Checkbox(value=long_takes.SETTINGS["infill"]),
+                        gr.Checkbox(value=long_takes.SETTINGS["tail_tidy"]),
                         gr.Checkbox(value=long_takes.SETTINGS["word_check"]),
                         gr.Slider(value=long_takes.SETTINGS["voice_guidance"]))
 
             Context.root_block.load(current_settings,
-                                    outputs=[found["unlock"], found["ref_hint"], enabled, lookahead, infill_box, word_box,
-                                             voice_slider],
+                                    outputs=[found["unlock"], found["ref_hint"], enabled, lookahead, infill_box, tidy_box,
+                                             word_box, voice_slider],
                                     queue=False, api_visibility="private")
             Context.root_block.load(lambda: guidance_state(long_takes.SETTINGS["word_check"]), outputs=guidance,
                                     queue=False, api_visibility="private")
@@ -372,8 +533,9 @@ def extended_studio():
     gr.Textbox.input = on_input
     gr.Accordion.__init__ = on_accordion
     Path.read_text = on_read_text
+    gr.Slider.__init__ = on_slider
     if SAMPLING_DEFAULTS:
-        gr.Slider.__init__, gr.Button.click = on_slider, on_click
+        gr.Button.click = on_click
     try:
         yield
     finally:

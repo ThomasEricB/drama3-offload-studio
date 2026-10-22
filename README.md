@@ -276,6 +276,9 @@ The Studio's checkboxes and sliders cover most of these; the environment variabl
 | `DRAMA3_REF_UNLOCKED` | `0` | Allow reference clips up to 60 s |
 | `DRAMA3_MAX_PAUSE_FRAMES` | `10` | Pause fix: silent frames before silence is masked (`0` = off) |
 | `DRAMA3_STALL_GUARD` | `1` | Stall guard (`0` = off) |
+| `DRAMA3_END_NUDGE` | `2` | Long scripts: pushes each chunk to end once it trails off into breath and room noise (`0` = off) |
+| `DRAMA3_TAIL_TIDY` | `1` | Long scripts: fades each chunk out 0.2 s after its last word and drops the hiss it trails (`0` = off; the Studio's "Trim chunk tails" box) |
+| `DRAMA3_ROOM_TONE` | `0` | Fill pauses between chunks (and subtitle waits) with noise shaped like the voice's background instead of silence |
 | `DRAMA3_WARM_UP` | `1` | `0` skips the startup warm-up take (always skipped by the portable engine) |
 | `DRAMA3_COMPILE` | `1` | `0` turns off regional `torch.compile` (NVIDIA) |
 | `DRAMA3_BACKEND` | `auto` | `cuda`, `mlx` (set by the MLX Start entries) or `portable`; `auto` picks `cuda` when available |
@@ -302,9 +305,12 @@ The app is a FastAPI server with Gradio mounted at `/` and `/workflow/`. The sim
 {
   "text": "[sighs] Fine. If we miss it, it's on you.",
   "voice": { "mode": "clone", "id": "clone1" },
-  "temperature": 1.0, "top_p": 0.9, "top_k": 0
+  "temperature": 1.0, "top_p": 0.9, "top_k": 0,
+  "seed": 1234
 }
 ```
+
+- `seed` (optional, 0 to 4294967295) makes a take repeatable: the same seed, text, voice and settings give the same take, and every chunk of a long script starts from it. Leave it out for a random one; a retake keeps its take's seed unless you send another. Every event of the take (from `start` to `done`) reports its `seed`, so a stopped take has it too.
 
 - `voice.mode` is `"clone"` (with `id` set to a preset `clone1`/`clone2`/`clone3` or an id returned by `/api/voices`, and an optional `transcript`), `"design"` (with `name` and `description`, plus an optional `scene`) or `"random"`.
 - To retake a line with a director's note, send `"retake_of": "<take_id>", "note": "angrier, faster"`. With `"note": ""` it is an edit: send the changed `text`, and the changed words are infilled (or, if that is not possible, the line is read with the earlier takes as context).

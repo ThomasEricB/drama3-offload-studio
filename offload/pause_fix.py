@@ -36,6 +36,23 @@ PAUSE_WINDOW_MAX = int(os.environ.get("DRAMA3_PAUSE_WINDOW_MAX", 10))
 # they never start a pause count, but they count in the window and are masked with
 # the silence codes while a pause is cut, so the model has to speak
 QUIET_CODES = (112, 436, 1242, 1573, 2546, 2586, 3303)
+# The end nudge (takes that ask for it: long_takes sets end_nudge around each chunk).
+# The model ends a line late: after its last word the audio decays for ~0.3 s, then it
+# goes on for another ~0.6 s of breath and room noise (silence codes in about every
+# second frame, -45..-50 dB) before it draws end of speech, and a chunk join played that
+# hiss before the join's own pause. Once the take is past END_FROM_RATIO of the expected
+# length, end of speech gets END_NUDGE more log-odds per silence or quiet code beyond
+# END_MIN-1 in the last END_WINDOW frames (at most END_STEPS steps): the decay right after
+# the last word has no silence codes, so it is kept, and the model still chooses to stop.
+# Mid-line pauses have as many silence codes as these tails, and lines ran 0.74-1.26x
+# their expected length: over 24 chunks (6 takes) the window, threshold and start below
+# were the ones that never nudged before a chunk's last word. The rest of a tail is cut
+# after the take (long_takes.tidy_tail).
+END_NUDGE = float(os.environ.get("DRAMA3_END_NUDGE", 2.0))
+END_WINDOW = int(os.environ.get("DRAMA3_END_WINDOW", 8))
+END_MIN = int(os.environ.get("DRAMA3_END_MIN", 4))
+END_STEPS = int(os.environ.get("DRAMA3_END_STEPS", 4))
+END_FROM_RATIO = float(os.environ.get("DRAMA3_END_FROM_RATIO", 1.2))
 END_RATIO = float(os.environ.get("DRAMA3_PAUSE_END_RATIO", 2.0))
 CAP_RATIO = float(os.environ.get("DRAMA3_PAUSE_CAP_RATIO", 3.0))
 _CJK_PUNCT = {0x3002, 0x3001, 0xFF01, 0xFF1F, 0x300C, 0x300D, 0x2026, 0x30FB, 0xFF08, 0xFF09}
@@ -112,11 +129,17 @@ def install(silence_codes_path: str) -> None:
             # largely quiet codes, while the pauses that stall are mostly silence codes)
             self.window_rule = "quiet"
             self.status = torch.zeros(3, dtype=torch.long, device=device)  # main, finite, silent run
+            self.end_window = torch.zeros(max(1, END_WINDOW), dtype=torch.long, device=device)
+            self.end_from = torch.full((1,), torch.iinfo(torch.long).max, dtype=torch.long, device=device)
 
         def run(self, kv_len: int) -> None:
             backbone, tower = self.model.backbone, self.model.audio_decoder
             logits = self.main_logits()
             finite = torch.isfinite(logits).all()
+            if END_NUDGE > 0:  # candidates are [EOS, semantic 0 .. 4095]
+                steps = (self.end_window.sum() - (END_MIN - 1)).clamp(0, END_STEPS)
+                bias = torch.where(self.out_index >= self.end_from, steps * END_NUDGE, 0.0).to(logits.dtype)
+                logits = torch.cat((logits[..., :1] + bias, logits[..., 1:]), -1)
             if MAX_PAUSE_FRAMES > 0:
                 clamp = self.silence_candidates & (self.silent_run >= MAX_PAUSE_FRAMES)
                 if self.window_rule == "quiet":
@@ -136,6 +159,7 @@ def install(silence_codes_path: str) -> None:
             paused = self.pause_lookup.index_select(0, sampled[0, 1:2])
             self.silent_window.copy_(torch.cat((self.silent_window[1:], paused.long())))
             self.silence_window.copy_(torch.cat((self.silence_window[1:], silent.long())))
+            self.end_window.copy_(torch.cat((self.end_window[1:], paused.long())))
             self.status.copy_(torch.stack((sampled[0, 0], finite.long(), self.silent_run[0])))
             self.frame.copy_(sampled)
             self.history.copy_(torch.cat((self.history[1:], sampled[0, :1])))
@@ -157,11 +181,15 @@ def install(silence_codes_path: str) -> None:
             self.silent_run.zero_()
             self.silent_window.zero_()
             self.silence_window.zero_()
+            self.end_window.zero_()
+            self.end_from.fill_(torch.iinfo(torch.long).max)  # off unless the engine sets it
 
     de.DecodeGraphs = PauseClampGraphs
     base_engine = de.Engine
 
     class PauseClampEngine(base_engine):
+        end_nudge = False  # set by long_takes around the chunks of a long script
+
         @torch.inference_mode()
         def frames(self, prompt, request):
             """The Space's frame loop, plus the length guard and the end-after-pause rule."""
@@ -169,6 +197,8 @@ def install(silence_codes_path: str) -> None:
             first_position = len(prompt) - 1
             eos = self.config.eos_token_id
             expected = expected_frames(request.text)
+            if self.end_nudge and END_NUDGE > 0 and hasattr(graphs, "end_from"):
+                graphs.end_from.fill_(int(END_FROM_RATIO * expected))
             end_frames, cap_frames = int(END_RATIO * expected), int(CAP_RATIO * expected)
             status = torch.empty(3, dtype=torch.long, pin_memory=True)
             ready = torch.cuda.Event()

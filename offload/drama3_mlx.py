@@ -92,6 +92,14 @@ class MlxThread:
 
 
 MLX = MlxThread()
+ACTIVE = False  # set by install(): the MLX backend runs the takes (seeds.seed_rng seeds MLX too)
+
+
+def seed(value: int) -> None:
+    """Seed MLX's global random state, which sampling draws from (on the MLX thread)."""
+    import mlx.core as mx
+
+    MLX(mx.random.seed, value)
 
 
 # ─── Weights ──────────────────────────────────────────────────────────────────
@@ -363,6 +371,8 @@ def install() -> None:
     """Make the backend load the MLX model and build MlxEngine instead of the CUDA Engine."""
     import drama3_engine
 
+    global ACTIVE
     drama3_engine.load_weights = load_weights
     drama3_engine.Engine = make_mlx_engine()
+    ACTIVE = True
     log(f"MLX engine: {model_name()} from {model_dir()}")
