@@ -120,6 +120,10 @@ elif backend == "portable":
     drama3_portable.install()
 else:
     raise SystemExit(f"DRAMA3_BACKEND must be auto, cuda, mlx or portable; got {backend!r}")
+if backend != "mlx":
+    import upstream_sampling  # noqa: E402
+
+    upstream_sampling.install()  # the Studio's "Enable Experimental Changes" sampling (off by default)
 
 import uvicorn  # noqa: E402
 

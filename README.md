@@ -20,7 +20,8 @@ The Space needs a ~45 GB GPU. This launcher runs the same Studio locally, with t
 - **No script length limit.** Long scripts are split into chunks that play as one take, each voiced knowing the next.
 - **Edit by infilling.** Change a few words and only those words are regenerated; the audio around them is kept.
 - **Quality Mode.** Every take is checked word by word with Whisper and remade if words are missing, and a cloned voice can be guided closer to its clip.
-- **Fewer broken takes:** a [pause fix](#pause-fix) and a [stall guard](#stall-guard) for takes that go silent or drone, and [checks while streaming](#every-word-read-while-streaming) that catch skipped words.
+- **Fewer broken takes:** a [pause fix](#pause-fix) and a [stall guard](#stall-guard) for takes that go silent or drone, and [checks while streaming](#every-word-read-while-streaming) that catch skipped words and make the missing ones.
+- **Clean chunk joins:** each chunk's trailing breath and hiss fade out under the start of the next, without fading a word.
 - **Tags that work with clones.** [Tag guidance](#tag-guidance) makes a cloned voice follow `<whisper>` and other `<tags>`.
 - **Subtitles:** import an `.srt` as a timed script, or export the subtitles of any take.
 - **Reference clips up to 60 s** instead of 20 s.
@@ -79,12 +80,24 @@ None of these are spoken. The script box highlights them, and the **Direction ta
 
 Under it, **Voice guidance** (0-3, default 2) makes a cloned voice closer to its clip, at about 1.5x the time. It is greyed out while Quality Mode is off, as it only applies to takes that are not streamed. See [voice guidance](#voice-guidance) for what it does and what it costs.
 
+Above it, in the same box:
+
+- **Enable Experimental Changes** (off by default) switches four sampler changes together, from the next take; off, every draw is the Space's own.
+  - The main token (end of speech or a semantic code) is drawn with no top-p cut. In a drone the repeating code holds ~97% and end of speech ~3%, which top-p 0.9 cuts on every step ([torenyx/drama3-24gb](https://github.com/torenyx/drama3-24gb)).
+  - A remake after a stall also loosens the repeat-avoiding redraw (same source).
+  - The 10 acoustic codebooks draw from at most 30 candidates, and the redraw keeps the token that crosses top-p: SGLang Omni's fixes of 2026-10-20 ([#2810](https://github.com/sgl-project/sglang-omni/pull/2810), [#2890](https://github.com/sgl-project/sglang-omni/pull/2890)).
+  - With Quality Mode on, a take with a phrase that jumps far above the voice's pitch is made once more (the register guard of [drama-tensorfold](https://github.com/plotarmordev/drama-tensorfold)).
+  - Tested on pause-heavy lines (two cloned voices, 80 takes a side): 70 drones caught instead of 136, 61 takes right first time instead of 51, 17 still missing words after every retry instead of 26. A seed makes a different take with them on.
+- **Length Hint** (off by default) adds Drama 3's `[audio tokens: N]` to every line, at 0.8 of the length the words need ([mlx-speech #49](https://github.com/appautomaton/mlx-speech/pull/49)). It steadies the pacing; blind, it was preferred on long takes.
+
 ### Long scripts and edits
 
 The card under the stage holds the options for long scripts:
 
-- **Long scripts.** A script longer than about 300 bytes is split into chunks at sentence ends, then clause marks, then spaces, never inside a `[cue]` or `<tag>…</tag>`. The chunks play as one take, and the counter under the script shows how many there are. Each chunk sees the first and the latest chunk as history (their text and audio), the layout fish-speech uses, so the voice stays the same; a pause is added at each join (0.45 s after a sentence, 0.25 s after a clause mark, 0.12 s otherwise, counting the silence the chunk already ends with). Tested: a 1,034-character story played as 5 chunks, 51-80 s long, at 1.9-2.1x real time, with a 0.98-0.995 word match in Clone, Surprise and Design.
+- **Long scripts.** A script longer than about 300 bytes is split into chunks at sentence ends, then clause marks, then spaces, never inside a `[cue]` or `<tag>…</tag>`. The chunks play as one take, and the counter under the script shows how many there are. Each chunk sees the first and the latest chunk as history (their text and audio), the layout fish-speech uses, so the voice stays the same; the next chunk starts a pause after the last word (0.45 s after a sentence, 0.25 s after a clause mark, 0.12 s otherwise). Line breaks inside the script are sent as spaces: with blank lines in its text Drama 3 could stop ending and draw silence instead (2 drones in 16 takes before, 0 after). Tested: a 1,034-character story played as 5 chunks, 51-80 s long, at 1.9-2.1x real time, with a 0.98-0.995 word match in Clone, Surprise and Design.
 - **Read ahead across chunks** (on by default): each chunk is voiced knowing the next one, Drama 3's streaming-input format from the [technical report](https://github.com/fishaudio/fish-speech/blob/main/docs/assets/Fish_Audio_Drama_3_Technical_Report.pdf) (Figure 10). On a 5-chunk story (6 seeds per voice), a clone's pitch jump across a join fell from 3.35 to 2.29 semitones and the pitch spread between chunks from 1.28 to 0.92; Surprise voices did not change; words were unchanged (0.99) and takes about 6% brisker.
+- **Crossfade chunk joins** (on by default): a chunk keeps full level 80 ms past its last word, then only its trailing breath and hiss fade out, and the next chunk starts at full level 0.35 s before that fade ends, so the fading hiss runs under its first words. No word is faded in or out. A chunk that ends right after its last word fades to silence and the pause is kept. Blind, over six joins: plain crossfades beat a trimmed end and a silent pause (which was picked worst in 4 of 6), and this speech-safe one beat a plain crossfade (best in 5 of 6).
+- **Trim chunk tails** (on by default, used with crossfading off): each chunk is held 80 ms past its last word, faded out over 0.25 s and cut, before a silent pause.
 - **Edit by infilling** (on by default): Drama 3's own editing method (report section 5.5, Figure 14).
   - Whisper's word timestamps locate the edit window, and the model fills it from a prompt holding the new text, a duration hint, and the audio after and before the window. The whole clip is decoded together, so the seams are smooth.
   - Whisper then checks that the new words are heard and the clip matches its script as well as before; otherwise it retries once, then regenerates the whole chunk.
@@ -170,7 +183,7 @@ Drama 3 sometimes goes silent at a tag or sentence boundary and never resumes or
 
 - After 10 silent frames in a row (0.47 s; a frame is silent when its first code is one of the 143 in `silence_codes.json`), silence is masked from the next draw, so the model must resume speaking or end.
 - The model also pauses in silence broken every few frames by a quiet code that isn't on the list, so a pause is also cut when 10 of the last 20 frames are silent or one of 7 such quiet codes (`[clears throat] Senhoras e senhores... [hesitates]` stalled in 7 of 8 takes before, 0 of 8 after; normal speech kept the same words, length and pauses).
-- A length guard estimated from the text ends a take that pauses after twice its expected length, or reaches three times it.
+- A length guard estimated from the text ends a take that pauses after twice its expected length, or reaches 2.5 times it (over 469 finished takes speech ran at most 2.09 times the estimate).
 
 Tested on the full model: normal lines, slow "dramatic pauses" retakes and a 72 s long script kept every word (53/53, 53/53, 196/196). Without it, drama3-small went silent after its first sentence and never ended.
 
@@ -190,7 +203,7 @@ The model sometimes loses its place: it skips a span (more often a tagged one), 
 
 - **Directed first takes.** `Direction: …` / `Line: …` is Drama 3's format for a conversation about an earlier take. A first take often lost its place in it, so it is sent as the line under a `[style prefix]` instead; retakes keep the `Direction:` form.
 - **Opening check.** The server holds a take's first 2.5 s anyway; the first 2 s are transcribed and must match the start of the line, or the take starts again (at most twice). A spoken direction or a skipped opening scored 0.53 or less, good openings mostly 0.88-1.0.
-- **Ending check.** When a take ends it is transcribed, and missing last words are made as a continuation that streams after a short pause.
+- **Ending check.** When a take or a long script's chunk ends it is transcribed, and missing last words, or the rest of a chunk that stalled, are made as a continuation of it. In Quality Mode the same is tried before a take is made again from scratch (3 chunks recovered this way in 18 long takes, all complete afterwards). The idea of resuming instead of remaking is from [bidirectional-voice-claude #26](https://github.com/gabacool/bidirectional-voice-claude/pull/26).
 - Whisper runs on the GPU for these checks (a 2 s opening in ~0.08 s instead of ~2 s on the CPU, ~1.5 GB of the VRAM reserve).
 
 `Direction: Donald Trump is having a chat with Elizabeth Holmes from Theranos` / `Line: <whispers> Okay... Alright... Good chat. </whispers> Are you being real, right now?`, streamed: complete in 11 of 12 takes with a random voice (1 of 12 before) and 10 of 10 with a clone (3 of 10 before), the span whispered and the rest voiced.
@@ -277,8 +290,15 @@ The Studio's checkboxes and sliders cover most of these; the environment variabl
 | `DRAMA3_MAX_PAUSE_FRAMES` | `10` | Pause fix: silent frames before silence is masked (`0` = off) |
 | `DRAMA3_STALL_GUARD` | `1` | Stall guard (`0` = off) |
 | `DRAMA3_END_NUDGE` | `2` | Long scripts: pushes each chunk to end once it trails off into breath and room noise (`0` = off) |
-| `DRAMA3_TAIL_TIDY` | `1` | Long scripts: fades each chunk out 0.2 s after its last word and drops the hiss it trails (`0` = off; the Studio's "Trim chunk tails" box) |
+| `DRAMA3_TAIL_TIDY` | `1` | Long scripts: holds each chunk 80 ms past its last word (`DRAMA3_TAIL_HOLD_S`), fades it out over 0.25 s (`DRAMA3_TAIL_FADE_S`) and drops the hiss it trails (`0` = off; the Studio's "Trim chunk tails" box) |
+| `DRAMA3_CROSSFADE` | `1` | The Studio's "Crossfade chunk joins" box: each chunk's tail (breath, hiss) fades out under the start of the next, `DRAMA3_CROSSFADE_S` (0.35 s) before its end, instead of a trimmed end and a silent pause; no word is faded. `0` = trim and pause |
+| `DRAMA3_WARM_START` | `0` | Decode a take's first windows after its reference clip's codes instead of cold. Tamed one clone's loud openings, but distorted another's first words, so off |
+| `DRAMA3_PAUSE_CAP_RATIO` | `2.5` | The pause fix ends a take that runs this many times its text's expected length (babble) |
+| `DRAMA3_ONE_LINE` | `1` | Send line breaks inside a line as spaces (blank lines made Drama 3 drone instead of ending); `0` sends them as written |
+| `DRAMA3_LENGTH_HINT` | `0` | The Studio's "Length Hint" box: add Drama 3's `[audio tokens: N]` to every turn, at `DRAMA3_LENGTH_HINT_RATIO` (0.8) of the pause fix's length estimate (steadier pacing); `1` = on |
 | `DRAMA3_ROOM_TONE` | `0` | Fill pauses between chunks (and subtitle waits) with noise shaped like the voice's background instead of silence |
+| `DRAMA3_EXPERIMENTAL_SAMPLING` | `0` | Start with the Studio's "Enable Experimental Changes" on: the main token drawn with no top-p cut, a stalled take's remake with an uncut repeat-avoiding redraw (from torenyx/drama3-24gb), acoustic codebook heads capped at top-k 30 and the redraw keeping the token that crosses top-p (SGLang Omni, 2026-10-20), and in Quality Mode the register guard: a take with a phrase that jumps far above the voice's pitch is made once more (drama-tensorfold). Half as many drones in testing |
+| `DRAMA3_REGISTER_ST` | `6` | The register guard's jump, in semitones above the take's other phrase openings (`0` = off) |
 | `DRAMA3_WARM_UP` | `1` | `0` skips the startup warm-up take (always skipped by the portable engine) |
 | `DRAMA3_COMPILE` | `1` | `0` turns off regional `torch.compile` (NVIDIA) |
 | `DRAMA3_BACKEND` | `auto` | `cuda`, `mlx` (set by the MLX Start entries) or `portable`; `auto` picks `cuda` when available |
@@ -397,6 +417,7 @@ The Gradio endpoints are also available through `gradio_client` (`Client("http:/
 - [pentacoxian-dev](https://huggingface.co/pentacoxian-dev/drama3-small-GGUF) for drama3-small and the pause fix it was published with.
 - fcmeyer for the [MLX conversions](https://huggingface.co/fcmeyer/drama-3-MLX-4bit-HQ), and [mlx-audio](https://github.com/Blaizzy/mlx-audio) for the Drama 3 MLX port.
 - T8star's [ComfyUI-Drama3-T8](https://github.com/T8mars/Comfyui-Drama-3) for the idea behind the stall guard.
+- [SGLang Omni](https://github.com/sgl-project/sglang-omni) (Apache-2.0) for the sampler fixes behind the experimental codebook cap and crossing token, found through [Frosty40's B70 Turbo](https://huggingface.co/Frosty40/Drama-3-B70-Turbo-GGUF); [torenyx/drama3-24gb](https://github.com/torenyx/drama3-24gb) for the drone analysis behind the uncut main token and stall retry; [drama-tensorfold](https://github.com/plotarmordev/drama-tensorfold) for the register guard; [bidirectional-voice-claude](https://github.com/gabacool/bidirectional-voice-claude) for resuming cut-off lines and joining paragraph breaks; [mlx-speech](https://github.com/appautomaton/mlx-speech) for the length hint. These are reimplemented here, not copied.
 
 The Space code is Apache-2.0. The vendored fish-speech code keeps its own license (`app/fish_speech/LICENSE`). The model weights are under the [Fish Audio Community License](https://huggingface.co/fishaudio/drama-3/blob/main/LICENSE), version 1.0:
 

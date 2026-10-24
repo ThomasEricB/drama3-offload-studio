@@ -9,7 +9,7 @@ a tag or sentence boundary and never resume or stop. drama3-small's authors fixe
   from the next main-token draw: the model must resume speaking or end.
 - Length guard, from the text's expected length (2 frames per Latin letter or digit,
   3.88 per CJK character, 23.9 per [tag] / <tag>, + 8.5): a pause after 2x that length
-  ends the take; 3x ends it regardless.
+  ends the take; 2.5x ends it regardless (DRAMA3_PAUSE_CAP_RATIO).
 
 The masking and the silence count run inside the decode graph (tensor ops); the two
 stop rules run on the host, which reads the count with the step's status.
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 import torch
 import torch.nn.functional as F
@@ -54,7 +55,10 @@ END_MIN = int(os.environ.get("DRAMA3_END_MIN", 4))
 END_STEPS = int(os.environ.get("DRAMA3_END_STEPS", 4))
 END_FROM_RATIO = float(os.environ.get("DRAMA3_END_FROM_RATIO", 1.2))
 END_RATIO = float(os.environ.get("DRAMA3_PAUSE_END_RATIO", 2.0))
-CAP_RATIO = float(os.environ.get("DRAMA3_PAUSE_CAP_RATIO", 3.0))
+# Over 469 finished takes (two cloned voices, short directed lines) speech ran 0.28-2.09x
+# the expected length (p50 0.67, p99 1.58): 2.5x cuts a babbling take a sixth sooner than
+# the drama3-small authors' 3x, with room above every take seen.
+CAP_RATIO = float(os.environ.get("DRAMA3_PAUSE_CAP_RATIO", 2.5))
 _CJK_PUNCT = {0x3002, 0x3001, 0xFF01, 0xFF1F, 0x300C, 0x300D, 0x2026, 0x30FB, 0xFF08, 0xFF09}
 SILENCE_CODES: list[int] = []
 SILENCE_SET: set[int] = set()
@@ -70,10 +74,14 @@ def load_codes(silence_codes_path: str) -> None:
     SILENCE_SET.update(SILENCE_CODES)
 
 
+HINTS = re.compile(r"\[(?:audio tokens|language)\s*:[^\]]*\]", re.I)
+
+
 def expected_frames(text: str) -> float:
     """The patch's fitted estimate of a line's length in frames (21.5 per second)."""
     if text.startswith("Direction:") and "\nLine:" in text:
         text = text.split("\nLine:", 1)[1]
+    text = HINTS.sub(" ", text)  # not spoken: no pause or tag time
     cjk = latin = spans = 0
     square = angle = 0
     for char in text:

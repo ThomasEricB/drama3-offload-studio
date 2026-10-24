@@ -12,12 +12,14 @@ is built, without changing the Space's files:
 - The stage's take history: a click on a take's row selects it, without playing it.
 - The script box's text cursor shows on its highlighted [cues] and <tags> too, and stays
   on its words in a script longer than the box (EXTRAS_CSS).
-- In the same card: "Read ahead across chunks" (lookahead), "Edit by infilling", and
-  subtitles: import an .srt as a timed script, download the .srt of the current take.
-- A box of its own between the Voice card and Sampling: "Check every word before
-  playing (Quality Mode)" (word_check.py), and folded under it like Sampling, its
-  "Voice guidance" strength (tag_guidance.py; full model only), greyed out while the
-  check is off.
+- In the same card: "Read ahead across chunks" (lookahead), "Trim chunk tails" and
+  "Crossfade chunk joins" (how chunks join), "Edit by infilling", and subtitles: import an
+  .srt as a timed script, download the .srt of the current take.
+- A box of its own between the Voice card and Sampling: "Enable Experimental Changes"
+  (upstream_sampling.py, register_guard.py; off by default), "Length Hint" (off by
+  default), "Check every word before playing (Quality Mode)" (word_check.py), and folded
+  under it like Sampling, its "Voice guidance" strength (tag_guidance.py; full model
+  only), greyed out while the check is off.
 - Sampling: the seed (seeds.py), a field that opens empty: a new random seed per take
   (a Retake keeps its take's); a number in it (typed, the last take's, or a new one) is
   kept for every take. Each take shows its seed in the stage: a click on it keeps it.
@@ -344,6 +346,22 @@ def extended_studio():
         """"Check every word" and its voice guidance (folded away, like Sampling)."""
         # (a folded Accordion's contents are not rendered, so the style is outside it)
         gr.HTML(f"<style>{EXTRAS_CSS}</style>", padding=False, container=False, elem_id="studio-extras-style")
+        sampling = sys.modules.get("upstream_sampling")  # not with the MLX backend
+        found["experimental_box"] = gr.Checkbox(
+            value=bool(sampling and sampling.ENABLED), label="Enable Experimental Changes",
+            visible=sampling is not None,
+            info="Four sampler changes from others' findings: the main token is drawn with no top-p cut (top-p "
+                 "0.9 cuts a drone's way out, the end of speech), and a remake after a stall also loosens its "
+                 "repeat-avoiding redraw (torenyx/drama3-24gb); the 10 acoustic codebooks draw from at most 30 "
+                 "candidates, and the redraw keeps the token that crosses top-p (SGLang Omni). On pause-heavy "
+                 "lines, half as many drones and more takes right first time. With Quality Mode on, a take whose "
+                 "phrase jumps far above the voice's pitch is also made once more (drama-tensorfold's register "
+                 "guard). A seed makes a different take with them on.")
+        found["hint_box"] = gr.Checkbox(
+            value=long_takes.SETTINGS["length_hint"], label="Length Hint (Might improve short generations)",
+            info="Each line tells the model about how long it should take, from its words (Drama 3's "
+                 "[audio tokens: N]). Steadier pacing, preferred blind on long takes. Off: the model picks "
+                 "the length itself.")
         found["word_box"] = gr.Checkbox(
             value=long_takes.SETTINGS["word_check"], label="Check every word before playing (Quality Mode)",
             info="**DISABLES STREAMING AND REAL-TIME GENERATION!** Each take is held until Whisper confirms every "
@@ -459,9 +477,15 @@ def extended_studio():
                                         info="Each chunk of a long script is voiced knowing the next one (Drama 3's "
                                              "streaming-input format), for smoother joins.")
                 tidy_box = gr.Checkbox(value=long_takes.SETTINGS["tail_tidy"], label="Trim chunk tails",
-                                       info="Quality Mode: each chunk fades out 0.2 s after its last word and the "
-                                            "join is silent, dropping the hiss the model trails. Off keeps every "
-                                            "chunk as made, breaths and soft word endings included.")
+                                       info="With crossfading off: each chunk is held 80 ms past its last word, "
+                                            "faded out and cut, and the join is silent, dropping the hiss the model "
+                                            "trails. Off keeps every chunk as made, breaths and soft word endings "
+                                            "included.")
+                crossfade_box = gr.Checkbox(
+                    value=long_takes.SETTINGS["crossfade"], label="Crossfade chunk joins",
+                    info="Each chunk's trailing breath and hiss fade out under the start of the next one instead "
+                         "of a trimmed end and a silent pause; no word is faded. Preferred blind at 5 of 6 joins. "
+                         "Off: trimmed ends (\u201cTrim chunk tails\u201d) and silent pauses.")
                 infill_box = gr.Checkbox(value=long_takes.SETTINGS["infill"], label="Edit by infilling",
                                          info="With an empty note, an edit regenerates only the words that changed "
                                               "and keeps the audio around them; large edits redo the chunk.")
@@ -482,7 +506,16 @@ def extended_studio():
             lookahead.change(setting("lookahead"), inputs=lookahead, queue=False, api_visibility="private")
             infill_box.change(setting("infill"), inputs=infill_box, queue=False, api_visibility="private")
             tidy_box.change(setting("tail_tidy"), inputs=tidy_box, queue=False, api_visibility="private")
+            crossfade_box.change(setting("crossfade"), inputs=crossfade_box, queue=False, api_visibility="private")
             word_box.change(setting("word_check"), inputs=word_box, queue=False, api_visibility="private")
+            experimental_box, hint_box = found["experimental_box"], found["hint_box"]
+            hint_box.change(setting("length_hint"), inputs=hint_box, queue=False, api_visibility="private")
+
+            def set_experimental(value):
+                if (sampling := sys.modules.get("upstream_sampling")) is not None:
+                    sampling.set_enabled(bool(value))
+
+            experimental_box.change(set_experimental, inputs=experimental_box, queue=False, api_visibility="private")
 
             def guidance_state(checked):  # greyed out while the word check is off: it does nothing then
                 return (gr.Accordion(elem_classes=guidance_classes(checked)),
@@ -515,12 +548,15 @@ def extended_studio():
                         gr.Checkbox(value=long_takes.SETTINGS["lookahead"]),
                         gr.Checkbox(value=long_takes.SETTINGS["infill"]),
                         gr.Checkbox(value=long_takes.SETTINGS["tail_tidy"]),
+                        gr.Checkbox(value=long_takes.SETTINGS["crossfade"]),
                         gr.Checkbox(value=long_takes.SETTINGS["word_check"]),
-                        gr.Slider(value=long_takes.SETTINGS["voice_guidance"]))
+                        gr.Slider(value=long_takes.SETTINGS["voice_guidance"]),
+                        gr.Checkbox(value=bool(getattr(sys.modules.get("upstream_sampling"), "ENABLED", False))),
+                        gr.Checkbox(value=long_takes.SETTINGS["length_hint"]))
 
             Context.root_block.load(current_settings,
                                     outputs=[found["unlock"], found["ref_hint"], enabled, lookahead, infill_box, tidy_box,
-                                             word_box, voice_slider],
+                                             crossfade_box, word_box, voice_slider, experimental_box, hint_box],
                                     queue=False, api_visibility="private")
             Context.root_block.load(lambda: guidance_state(long_takes.SETTINGS["word_check"]), outputs=guidance,
                                     queue=False, api_visibility="private")

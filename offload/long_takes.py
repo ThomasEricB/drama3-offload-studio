@@ -14,6 +14,14 @@
   the cues; see parse_turn).
 - Reference clips: 20 s by default, as the Space; up to 60 s (the engine's limit)
   when unlocked.
+- Joins: each held chunk's trailing breath and hiss fade out under the start of the next
+  (speech-safe crossfade, crossfade_shape), or, with that off, end trimmed before a silent
+  pause (tidy_tail).
+- A take or chunk that ends before its last words, or stalls, gets them made as a
+  continuation of it (make_rest): when streamed, once it is made; in Quality Mode, before
+  it is made again from scratch.
+- Line breaks inside a line are sent as spaces (one_line), and an optional length hint
+  (length_hint) asks for about as long as the words need.
 
 Short single-chunk lines take the Space's own code path unchanged.
 """
@@ -32,6 +40,7 @@ import torch
 
 import chunking
 import infill
+import register_guard
 import seeds
 import subtitles
 import word_check
@@ -59,8 +68,12 @@ SETTINGS = {
     "voice_guidance": float(os.environ.get("DRAMA3_VOICE_GUIDANCE", "2")),
     # the Studio's Seed box (None: each take gets a random seed; see seeds.py)
     "seed": None,
-    # held chunks end 0.2 s after their last word, then silence (tidy_tail; off: as made)
+    # the Studio's "Length hint" box: "[audio tokens: N]" on every turn (see length_hint)
+    "length_hint": _flag("DRAMA3_LENGTH_HINT"),
+    # with crossfading off, held chunks end shortly after their last word, then silence (tidy_tail)
     "tail_tidy": os.environ.get("DRAMA3_TAIL_TIDY", "1").strip().lower() in {"1", "true", "yes", "on"},
+    # the Studio's "Crossfade chunk joins" box: joins as speech-safe crossfades (see crossfade_shape)
+    "crossfade": os.environ.get("DRAMA3_CROSSFADE", "1").strip().lower() in {"1", "true", "yes", "on"},
 }
 # Drama 3's streaming-input format (technical report, Figure 10): each chunk's turn also
 # shows the chunk that follows, after <|endofturn|>, so the model voices the current
@@ -68,6 +81,13 @@ SETTINGS = {
 END_OF_TURN = "<|endofturn|>"
 STREAM_INSTRUCTION = "streaming speech continuation with one-chunk lookahead split by <|endofturn|>"
 KEEPALIVE_S = 2.0  # empty packets while a chunk is held back (the server's idle limit is 15 s)
+# A take's first windows are decoded after its reference clip's codes, not cold: cold, the
+# codec's long memory (a window differs from a continuous decode for 2-3 s) started a cloned
+# take up to 4.5 dB loud (Joker clone: opening +3.3 dB over its steady level, +-1.2 warm;
+# a voice chat on Drama 3 measured +5.0 -> +0.85 dB, gabacool/bidirectional-voice-claude #26).
+# Off by default: blind, the warm start won all 3 Joker openings and lost all 3 Ramsay ones,
+# and some first words came out distorted (the reference's own sound carries into them).
+WARM_START = os.environ.get("DRAMA3_WARM_START", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def log(message: str) -> None:
@@ -106,6 +126,33 @@ def parse_retake(text: str) -> tuple[str | None, str]:
     """(note, words) of a turn (see parse_turn); a user's Direction is not a note."""
     note, _, words = parse_turn(text)
     return note, words
+
+
+# Line breaks inside a line are sent as spaces (the chunker still cuts at them): with blank
+# lines in its text Drama 3 stopped emitting end of speech and drew ~47 s of silence
+# (gabacool/bidirectional-voice-claude #24). DRAMA3_ONE_LINE=0 sends them as written.
+ONE_LINE = os.environ.get("DRAMA3_ONE_LINE", "1").strip().lower() in {"1", "true", "yes", "on"}
+# The length hint (Drama 3's "[audio tokens: N]", technical report Table 10) on every
+# turn, at LENGTH_HINT_RATIO of the pause fix's estimate (finished takes ran a median 0.67
+# of it): said to keep takes from stalling after a sentence (appautomaton/mlx-speech #49).
+# With lines split by blank lines (joined, ONE_LINE) it caused no more stalls, but held
+# each take to 0.76-0.83 of the estimate (0.66-0.98 without), and blind it was preferred
+# in all 4 long takes (the 2 short ones a toss-up). Off by default: the Studio's "Length
+# Hint" box (SETTINGS["length_hint"]; DRAMA3_LENGTH_HINT=1 starts with it on).
+LENGTH_HINT_RATIO = float(os.environ.get("DRAMA3_LENGTH_HINT_RATIO", 0.8))
+
+
+def one_line(text: str) -> str:
+    return re.sub(r"[ \t]*\n\s*", " ", text).strip() if ONE_LINE else text
+
+
+def length_hint(text: str) -> str:
+    """" [audio tokens: N]" for a turn's words, or "" when the hint is off."""
+    if not SETTINGS["length_hint"] or "[audio tokens" in text.lower():
+        return ""
+    import pause_fix
+
+    return f" [audio tokens: {max(1, round(LENGTH_HINT_RATIO * pause_fix.expected_frames(text)))}]"
 
 
 def directed_turn(direction: str | None, text: str) -> str:
@@ -201,13 +248,17 @@ SENTENCE_END = ".!?…。！？"
 CLAUSE_END = ",;:—–-、，；："
 
 
+def pause_after(text: str) -> float:
+    """Seconds of pause after a chunk that ends on text (JOIN_PAUSE_S by its last mark)."""
+    end = re.sub(r"(\s*</[^<>]*>)+$", "", text.rstrip())  # "reef.</menacing>" ends a sentence
+    end = end.rstrip().rstrip("\"'”’)]»」』").rstrip()
+    return JOIN_PAUSE_S["sentence" if end[-1:] in SENTENCE_END else "clause" if end[-1:] in CLAUSE_END else "word"]
+
+
 def join_pause(text: str, pcm: bytes, rate: int = 44100, tone: list[bytes] | None = None) -> bytes:
     """The pause to put after a chunk that ends on text, whose audio is pcm: room tone
     of the chunks in `tone` (see room_tone), or silence."""
-    end = re.sub(r"(\s*</[^<>]*>)+$", "", text.rstrip())  # "reef.</menacing>" ends a sentence
-    end = end.rstrip().rstrip("\"'”’)]»」』").rstrip()
-    kind = "sentence" if end[-1:] in SENTENCE_END else "clause" if end[-1:] in CLAUSE_END else "word"
-    missing = JOIN_PAUSE_S[kind] - edge_silence(pcm, rate)[1]
+    missing = pause_after(text) - edge_silence(pcm, rate)[1]
     return room_tone(tone or [pcm], int(max(0.0, missing) * rate))
 
 
@@ -341,7 +392,13 @@ def trim_tail(script: str, heard: list, pcm: bytes, codes):
 # It can clip a breath or a soft word ending: SETTINGS["tail_tidy"] (the Studio's "Trim
 # chunk tails" box, DRAMA3_TAIL_TIDY) turns it off.
 TAIL_SPEECH_DB = 24.0
-TAIL_FADE_OUT_S = 0.2
+TAIL_FADE_OUT_S = float(os.environ.get("DRAMA3_TAIL_FADE_S", 0.25))
+# full level kept this long past the speech end before the fade: a word's last consonant
+# sits at the level of the hiss that follows (both 24-35 dB under the loud level), so no
+# threshold tells them apart, and a fade from the speech end can soften it. In a blind
+# test of six joins, holding 80 ms then fading over 0.25 s was preferred in five (a
+# fade from the speech end over 0.2 s in one), neither ever picked as clipped or hissing.
+TAIL_HOLD_S = float(os.environ.get("DRAMA3_TAIL_HOLD_S", 0.08))
 TAIL_FADE_IN_S = 0.06
 
 
@@ -363,6 +420,63 @@ def speech_span(pcm: bytes, frames: int, heard: list | None = None, script: str 
         if words and words[-1].heard and words[-1].end is not None:
             end = max(end, words[-1].end)
     return int(speech[0]), end
+
+
+def shape_tail(samples, first: int, end: float):
+    """A chunk's samples (float, 44.1 kHz) held TAIL_HOLD_S past the speech end at `end`
+    seconds, faded out over TAIL_FADE_OUT_S and cut, with what comes before its first
+    speech frame faded in; or None when the chunk ends on its last word."""
+    import numpy as np
+
+    begin = min(samples.size, int((end + TAIL_HOLD_S) * 44100))
+    stop = min(samples.size, int((end + TAIL_HOLD_S + TAIL_FADE_OUT_S) * 44100))
+    if stop - int(end * 44100) < int((TAIL_HOLD_S + TAIL_FADE_OUT_S) * 44100) // 2:
+        return None
+    samples = samples[:stop].copy()
+    samples[begin:] *= np.linspace(1.0, 0.0, stop - begin, dtype=np.float32)
+    head = first * 2048
+    if head > 0:
+        rise = min(int(TAIL_FADE_IN_S * 44100), head)
+        samples[head - rise: head] *= np.linspace(0.0, 1.0, rise, dtype=np.float32)
+        samples[: head - rise] = 0.0
+    return samples
+
+
+# Speech-safe crossfade at a join (SETTINGS["crossfade"], on by default; off: the trim and
+# silent pause above). A chunk keeps full level TAIL_HOLD_S past its last word, then only
+# its tail (breath and hiss) fades out smoothly to the chunk's end, uncut; the next chunk
+# starts at full level CROSSFADE_S before that end (never sooner than CROSSFADE_GAP_S after
+# the hold), so the fading hiss runs under its first words, which mask it. Blind, over
+# six joins of the same takes: plain crossfades beat trim + silence (250 ms: best 4 of 6;
+# trim + silence: worst 4 of 6, never best), and this speech-safe one, which never fades a
+# word in or out, beat the plain 250 ms crossfade (best 5 of 6, never worst; 3 at 350 ms).
+CROSSFADE_S = float(os.environ.get("DRAMA3_CROSSFADE_S", 0.35))
+CROSSFADE_GAP_S = 0.15
+
+
+def crossfade_shape(samples, first: int, end: float, pause: float = 0.0):
+    """(samples, start) of a held chunk for a crossfade join: float samples (44.1 kHz) with
+    the tail faded out from TAIL_HOLD_S past the speech end at `end` seconds and what comes
+    before the first speech frame faded in; `start` is where the next chunk begins, at
+    least `pause` seconds after the speech end. A chunk that ends soon after its last word
+    (the end nudge often stops it within 0.2 s) has too little tail to overlap: it fades to
+    silence and is padded with silence up to `start`."""
+    import numpy as np
+
+    samples = samples.copy()
+    size = samples.size
+    fade_from = min(size, int((end + TAIL_HOLD_S) * 44100))
+    if size > fade_from:
+        samples[fade_from:] *= np.cos(np.linspace(0.0, np.pi / 2, size - fade_from, dtype=np.float32)) ** 2
+    start = max(size - int(CROSSFADE_S * 44100), fade_from + int(CROSSFADE_GAP_S * 44100), int((end + pause) * 44100))
+    if start > size:
+        samples = np.concatenate((samples, np.zeros(start - size, dtype=np.float32)))
+    head = first * 2048
+    if head > 0:
+        rise = min(int(TAIL_FADE_IN_S * 44100), head)
+        samples[head - rise: head] *= np.linspace(0.0, 1.0, rise, dtype=np.float32)
+        samples[: head - rise] = 0.0
+    return samples, start
 
 
 def keepalive(fn, *args):
@@ -407,10 +521,29 @@ def make_engine(base):
 
         take_seed = None  # this take's seed (seeds.py), None: the generator is left unseeded
         _seed_now = None  # the seed the next prefill applies
+        _stalled = False  # the last generation ended in a stall
+        _relax_now = False  # the next one remakes it: its RAS redraw is uncut (upstream_sampling)
 
         def use_seed(self, attempt: int) -> None:
             """The next generation is the take's remake number `attempt` (0: its own seed)."""
             self._seed_now = None if self.take_seed is None else seeds.attempt_seed(self.take_seed, attempt)
+            self._relax_now = attempt > 0 and self._stalled
+
+        def frames(self, prompt, request):
+            """Every backend's frame loop; a remake of one that stalled draws as
+            upstream_sampling.set_relaxed says."""
+            sampling = sys.modules.get("upstream_sampling")
+            relaxed, self._stalled = self._relax_now and getattr(sampling, "ENABLED", False), False
+            if relaxed:
+                log("remaking a stalled generation: its RAS redraw is uncut")
+                sampling.set_relaxed(True)
+            try:
+                reason = yield from super().frames(prompt, request)
+            finally:
+                if relaxed:
+                    sampling.set_relaxed(False)
+            self._stalled = reason == "stall"
+            return reason
 
         def prefill(self, prompt, request):
             """Every backend's frame loop starts with this: the seed applies to the
@@ -430,11 +563,16 @@ def make_engine(base):
                 yield {"type": "error", "message": f"Drama 3 request: {error}"}
                 return
             if plan is None:  # one chunk: the Space's own path
-                _, direction, words = parse_turn(request.text)
+                note, direction, words = parse_turn(request.text)
+                line = words
+                if note is None and not subtitles.is_timed(words):
+                    line = one_line(words) + length_hint(words)
                 if self.needs_prefix(request, direction):
-                    body = dict(body, input=prefixed_turn(direction, words))
+                    body = dict(body, input=prefixed_turn(direction, line))
                 elif direction is not None:  # as the model knows it, however it was pasted
-                    body = dict(body, input=with_turn(body["input"], directed_turn(direction, words)))
+                    body = dict(body, input=with_turn(body["input"], directed_turn(direction, line)))
+                elif line != words:
+                    body = dict(body, input=with_turn(body["input"], line))
                 check = word_check.checker(words, request.max_new_tokens)
                 if check is not None and SETTINGS["word_check"]:
                     yield from self.checked_speech(body, deadline, request, check, direction, words)
@@ -443,22 +581,23 @@ def make_engine(base):
                 events = (self.opening_checked(lambda: base_speech(body, deadline=deadline), check)
                           if check is not None and word_check.OPENING else base_speech(body, deadline=deadline))
                 pcm = bytearray()
-                for event in events:
-                    if event["type"] == "speech.audio.delta":
-                        pcm += event["pcm"]
-                    elif event["type"] == "speech.audio.done" and event.get("frames"):
-                        codes = self.last_codes(event["frames"])
-                        if check is not None and word_check.ENDING:
-                            rest = yield from self.finish_line(request, body["input"], direction, check,
-                                                               bytes(pcm), codes, event)
-                            if rest is not None:
-                                more, more_codes, event = rest
-                                pcm += more
-                                codes = torch.cat((codes, more_codes), dim=1)
-                        # kept (codes + audio) so an edit of this line can be infilled
-                        remember(request.text, LongTake(line=words, direction=direction, chunks=[
-                            ChunkAudio(words, request.text, codes, bytes(pcm))]))
-                    yield event
+                with self.warm_start(request):  # (decoding runs while the events are read)
+                    for event in events:
+                        if event["type"] == "speech.audio.delta":
+                            pcm += event["pcm"]
+                        elif event["type"] == "speech.audio.done" and event.get("frames"):
+                            codes = self.last_codes(event["frames"])
+                            if check is not None and word_check.ENDING:
+                                rest = yield from self.finish_line(request, body["input"], direction, check,
+                                                                   bytes(pcm), codes, event)
+                                if rest is not None:
+                                    more, more_codes, event = rest
+                                    pcm += more
+                                    codes = torch.cat((codes, more_codes), dim=1)
+                            # kept (codes + audio) so an edit of this line can be infilled
+                            remember(request.text, LongTake(line=words, direction=direction, chunks=[
+                                ChunkAudio(words, request.text, codes, bytes(pcm))]))
+                        yield event
                 return
             try:
                 yield from self.long_speech(request, *plan)
@@ -559,34 +698,83 @@ def make_engine(base):
             done = dict(done, frames=done["frames"] + frames, finish_reason=reason)
             return pause + more, self.last_codes(frames), done
 
+        def make_rest(self, request, turn, rest, voices, history, codes, *, live):
+            """The words a take or chunk ended without, made as a continuation of it: its
+            own turn and codes are the latest history turn, and the rest is decoded right
+            after them. Returns (audio, codes, finish reason) of the addition, or None.
+            Making the rest keeps what was said and adds only what is missing (a voice
+            chat on Drama 3 resumed 25 of 27 stalls this way, none lost or repeated, where
+            a whole remake repeated words: gabacool/bidirectional-voice-claude #26)."""
+            rows = self.fit_prompt(rest, voices, list(history) + [(turn, codes)], request.character)
+            self.use_seed(0)  # as a long script's next chunk
+            with self.joined_after(codes):
+                frames, reason, more = yield from self.generate(rows, request, rest, live=live)
+            if not frames:
+                return None
+            return more, self.last_codes(frames), reason
+
         def checked_speech(self, body, deadline, request, check, direction, words):
             """The Space's path, held until the take is made and its words checked;
             made again (at most word_check.RETRIES more times) when words are missing,
             and the best take is sent."""
-            best = None
-            for attempt in range(1 + word_check.RETRIES):
+            best, register_held = None, None
+            register = register_guard.active()
+            tries, attempt = 1 + word_check.RETRIES, -1
+            while (attempt := attempt + 1) < tries:
                 self.use_seed(attempt)
                 pcm, done, beat = bytearray(), None, time.perf_counter()
-                for event in self.voice_guided(super().speech(body, deadline=deadline), request):
-                    if event["type"] == "speech.audio.delta":
-                        pcm += event["pcm"]
-                        if time.perf_counter() - beat > KEEPALIVE_S:
-                            beat = time.perf_counter()
-                            yield {"type": "speech.audio.delta", "pcm": b""}
-                    elif event["type"] == "speech.audio.done":
-                        done = event
-                    else:
-                        yield event
-                        return
+                with self.warm_start(request):  # (decoding runs while the events are read)
+                    for event in self.voice_guided(super().speech(body, deadline=deadline), request):
+                        if event["type"] == "speech.audio.delta":
+                            pcm += event["pcm"]
+                            if time.perf_counter() - beat > KEEPALIVE_S:
+                                beat = time.perf_counter()
+                                yield {"type": "speech.audio.delta", "pcm": b""}
+                        elif event["type"] == "speech.audio.done":
+                            done = event
+                        else:
+                            yield event
+                            return
                 if done is None:
                     break
                 codes = self.last_codes(done["frames"]) if done.get("frames") else None
                 heard = yield from keepalive(check.hear, bytes(pcm))
                 score = check.score(heard)
                 word_check.log(f"take {attempt + 1}: {score:.2f} heard {word_check.heard_text(heard)[:80]!r}")
+                if codes is not None and score < word_check.PASS and register_held is None and (
+                        tail := word_check.missing_tail(check, heard, done.get("finish_reason") == "stall")):
+                    word_check.log(f"take {attempt + 1} ended before {tail!r}; making the rest")
+                    turn = request.text if body["input"].startswith(de.ENVELOPE_MARKER) else body["input"]
+                    rest = (prefixed_turn(direction, tail) if turn.startswith("[") and direction
+                            else directed_turn(direction, tail))
+                    added = yield from self.make_rest(request, turn, rest, self.voices(request, None), [], codes,
+                                                      live=False)
+                    if added is not None:
+                        more, more_codes, reason = added
+                        pcm += more
+                        codes = torch.cat((codes, more_codes), dim=1)
+                        done = dict(done, frames=codes.shape[1], finish_reason=reason)
+                        heard = yield from keepalive(check.hear, bytes(pcm))
+                        score = check.score(heard)
+                        word_check.log(f"take {attempt + 1} with the rest: {score:.2f} heard "
+                                       f"{word_check.heard_text(heard)[:80]!r}")
+                jump = register_guard.pcm_jump(bytes(pcm)) if register and score >= word_check.PASS else None
+                if register_held is not None:  # the register guard's remake
+                    if score >= word_check.PASS and (jump or 0.0) < register_held:
+                        best = (score, bytes(pcm), done, codes, heard)
+                        log(f"the remake's jump is {jump or 0.0:.1f}; it is kept")
+                    else:
+                        log("the remake is no better; the first take is kept")
+                    break
                 if best is None or score > best[0]:
                     best = (score, bytes(pcm), done, codes, heard)
                 if score >= word_check.PASS:
+                    if jump:
+                        log(f"a phrase opens {jump:.1f} semitones above the others (register guard), "
+                            f"making it once more")
+                        best = (score, bytes(pcm), done, codes, heard)
+                        register_held, tries = jump, attempt + 2
+                        continue
                     break
             if best is None:
                 return
@@ -767,21 +955,14 @@ def make_engine(base):
             if span is None:
                 return pcm, codes
             first, end = span
-            samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
-            stop = min(samples.size, int((end + TAIL_FADE_OUT_S) * 44100))
-            begin = int(end * 44100)
-            if stop - begin < int(TAIL_FADE_OUT_S * 44100) // 2:  # the chunk ends on its last word
+            whole = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
+            samples = shape_tail(whole, first, end)
+            if samples is None:  # the chunk ends on its last word
                 return pcm, codes
-            cut = (samples.size - stop) / 44100
-            samples = samples[:stop]
-            samples[begin:] *= np.linspace(1.0, 0.0, stop - begin, dtype=np.float32)
-            head = first * 2048
-            if head > 0:
-                rise = min(int(TAIL_FADE_IN_S * 44100), head)
-                samples[head - rise: head] *= np.linspace(0.0, 1.0, rise, dtype=np.float32)
-                samples[: head - rise] = 0.0
+            stop, head = samples.size, first * 2048
             codes = codes[:, : min(codes.shape[1], int(np.ceil(stop / 2048)))]
-            log(f"tail: cut {cut:.2f}s after the last word, faded {stop - begin} samples"
+            log(f"tail: cut {(whole.size - stop) / 44100:.2f}s after the last word, held {TAIL_HOLD_S:.2f}s "
+                f"and faded {TAIL_FADE_OUT_S:.2f}s"
                 + (f"; {head / 44100:.2f}s before the first faded in" if head else ""))
             return samples.astype("<i2").tobytes(), codes.contiguous()
 
@@ -801,11 +982,21 @@ def make_engine(base):
 
         @contextlib.contextmanager
         def joined_after(self, codes):
-            self._join_codes = codes
+            before, self._join_codes = self._join_codes, codes
             try:
                 yield
             finally:
-                self._join_codes = None
+                self._join_codes = before
+
+        def warm_start(self, request, voices=None):
+            """A take's first windows decoded after its reference clip's codes (WARM_START),
+            as a long script's later chunks are decoded after the chunk before them."""
+            if not WARM_START:
+                return contextlib.nullcontext()
+            if voices is None:
+                voices = self.voices(request, None) if request.voice_count else []
+            codes = voices[0].codes if voices and voices[0].codes is not None else None
+            return self.joined_after(codes) if codes is not None else contextlib.nullcontext()
 
         def queue_window(self, start: int, end: int, emitted: int):
             self._window = (start, emitted)
@@ -836,6 +1027,7 @@ def make_engine(base):
                 + (f", {len(planned) - regenerate} kept" if previous is not None else "")
                 + (f", note “{note}”" if note else ""))
             records: list[ChunkAudio] = []
+            register_before: list[float] = []  # phrase openings of the chunks so far (register_guard)
             frames_total, finish, first_audio = 0, "stop", None
             timed = subtitles.is_timed(words)
             position = 0  # bytes of audio sent so far (the subtitle timeline)
@@ -843,11 +1035,51 @@ def make_engine(base):
             def plain(text: str) -> str:  # a chunk's words without its subtitle timing
                 return subtitles.cue(text).text if timed else text
 
+            crossfade = SETTINGS["crossfade"] and not timed  # (timed cues keep their exact start)
+            pending = None  # the last chunk's held tail (float samples), mixed into the next one's start
+
+            def shaped(pcm: bytes, frames: int, script: str, heard=None):
+                """(samples, start) of a chunk for a crossfade join, or None."""
+                import numpy as np
+
+                span = speech_span(pcm, frames, heard, script) if crossfade else None
+                if span is None:
+                    return None
+                return crossfade_shape(np.frombuffer(pcm, dtype="<i2").astype(np.float32), *span, pause_after(script))
+
+            def send(pcm: bytes, shape=None):
+                """A chunk's audio packets, the held tail before it mixed into its start; with a
+                shape, its own tail from the shape's start is held for the next chunk."""
+                nonlocal pending
+                import numpy as np
+
+                data = pcm
+                if shape is not None or pending is not None:
+                    if shape is not None:
+                        samples, start = shape
+                    else:
+                        samples, start = np.frombuffer(pcm, dtype="<i2").astype(np.float32), None
+                    if pending is not None:
+                        samples = samples.copy()
+                        overlap = min(pending.size, samples.size)
+                        samples[:overlap] += pending[:overlap]
+                        if pending.size > overlap:  # a chunk shorter than the tail before it
+                            samples = np.concatenate((samples, pending[overlap:]))
+                            start = None
+                        pending = None
+                    if start is not None:  # (an empty tail still marks the join as made)
+                        samples, pending = samples[:start], samples[start:]
+                    data = np.clip(samples, -32768, 32767).astype("<i2").tobytes()
+                for offset in range(0, len(data), PACKET_BYTES):
+                    yield {"type": "speech.audio.delta", "pcm": data[offset:offset + PACKET_BYTES]}
+
             for index, chunk in enumerate(planned):
                 cue = subtitles.cue(chunk.text) if timed else None
                 if cue is not None and cue.start is not None:
                     # a subtitle cue starts at its time (or at once, if the one before ran over)
                     pause = room_tone([r.pcm for r in records[-3:]], max(0, int(cue.start * 44100) - position // 2))
+                elif records and pending is not None:  # a crossfade join: the held tail is the pause
+                    pause = b""
                 elif records:  # a pause at the join, kept out of the chunk's cached audio
                     pause = join_pause(plain(records[-1].text), records[-1].pcm,
                                        tone=[r.pcm for r in records[-3:]])
@@ -858,19 +1090,19 @@ def make_engine(base):
                     yield {"type": "speech.audio.delta", "pcm": pause}
                 if not chunk.changed:
                     record = previous.chunks[chunk.old[0]]
-                    for offset in range(0, len(record.pcm), PACKET_BYTES):
-                        yield {"type": "speech.audio.delta", "pcm": record.pcm[offset:offset + PACKET_BYTES]}
+                    yield from send(record.pcm, shaped(record.pcm, record.codes.shape[1], plain(record.text)))
                 elif (record := (yield from self.try_infill(previous, chunk, note, request))) is not None:
-                    for offset in range(0, len(record.pcm), PACKET_BYTES):
-                        yield {"type": "speech.audio.delta", "pcm": record.pcm[offset:offset + PACKET_BYTES]}
+                    yield from send(record.pcm, shaped(record.pcm, record.codes.shape[1], plain(record.text)))
                 else:
-                    text = subtitles.spoken_turn(cue) if cue is not None else chunk.text
+                    text = one_line(subtitles.spoken_turn(cue) if cue is not None else chunk.text)
+                    if cue is None:
+                        text += length_hint(text)
                     turn = (retake_turn(note, spoken(text) or text) if note
                             else prefixed_turn(direction, text) if prefix else directed_turn(direction, text))
                     if note and cue is not None and cue.frames:
                         turn += f" [audio tokens: {cue.frames}]"
                     streaming = SETTINGS["lookahead"]
-                    following = plain(planned[index + 1].text) if index + 1 < len(planned) else ""
+                    following = one_line(plain(planned[index + 1].text)) if index + 1 < len(planned) else ""
                     prompt_turn = f"{turn}{END_OF_TURN}{following}" if streaming else turn
                     history = list(extra)
                     if records:
@@ -887,14 +1119,17 @@ def make_engine(base):
                     # once without any of it having been heard.
                     check = word_check.checker(plain(chunk.text))
                     opening = check if check is not None and not records and word_check.OPENING else None
+                    # streamed (no word check): still heard once made, and its missing words made
+                    ending = check if word_check.ENDING and not SETTINGS["word_check"] else None
                     if not SETTINGS["word_check"]:
                         check = None
                     live = not records and check is None
-                    best = None
+                    best, register_held = None, None
+                    register = check is not None and not live and register_guard.active()
                     tries, attempt = 1 if live else 1 + max(1, word_check.RETRIES if check else 1), -1
                     while (attempt := attempt + 1) < tries:
                         self.use_seed(attempt)  # every chunk starts from the take's seed
-                        joined = self.joined_after(records[-1].codes) if records else contextlib.nullcontext()
+                        joined = self.joined_after(records[-1].codes) if records else self.warm_start(request, voices)
                         with joined:
                             if live and opening is not None:
                                 frames, reason, pcm = yield from self.opening_checked(
@@ -911,9 +1146,48 @@ def make_engine(base):
                             score = check.score(heard)
                             word_check.log(f"chunk {index + 1} take {attempt + 1}: {score:.2f} heard "
                                            f"{word_check.heard_text(heard)[:80]!r}")
+                        listener = check or ending
+                        if (listener is not None and frames and register_held is None
+                                and (ending is not None or score < word_check.PASS)):
+                            if heard is None:
+                                heard = yield from keepalive(listener.hear, pcm)
+                            tail = word_check.missing_tail(listener, heard, stalled=reason == "stall")
+                            if tail is not None:
+                                word_check.log(f"chunk {index + 1} take {attempt + 1} ended before {tail!r}; "
+                                               f"making the rest")
+                                rest = (retake_turn(note, spoken(tail) or tail) if note
+                                        else prefixed_turn(direction, tail) if prefix
+                                        else directed_turn(direction, tail))
+                                added = yield from self.make_rest(request, turn, rest, voices, history, codes,
+                                                                  live=live)
+                                if added is not None:
+                                    more, more_codes, reason = added
+                                    pcm, codes = pcm + more, torch.cat((codes, more_codes), dim=1)
+                                    frames = codes.shape[1]
+                                    heard = yield from keepalive(listener.hear, pcm)
+                                    score = check.score(heard) if check is not None else (
+                                        0.0 if reason == "stall" else 1.0)
+                                    word_check.log(f"chunk {index + 1} take {attempt + 1} with the rest: "
+                                                   f"{listener.score(heard):.2f} heard "
+                                                   f"{word_check.heard_text(heard)[:80]!r}")
+                        jump = (register_guard.pcm_jump(pcm, register_before)
+                                if register and frames and score >= word_check.PASS else None)
+                        if register_held is not None:  # the register guard's remake
+                            if score >= word_check.PASS and (jump or 0.0) < register_held:
+                                best = (score, frames, reason, pcm, codes, heard, prompt_turn)
+                                log(f"chunk {index + 1}: the remake's jump is {jump or 0.0:.1f}; it is kept")
+                            else:
+                                log(f"chunk {index + 1}: the remake is no better; the first take is kept")
+                            break
                         if best is None or score > best[0]:
                             best = (score, frames, reason, pcm, codes, heard, prompt_turn)
                         if live or score >= word_check.PASS:
+                            if jump:
+                                log(f"chunk {index + 1}: a phrase opens {jump:.1f} semitones above the others "
+                                    f"(register guard), making it once more")
+                                best = (score, frames, reason, pcm, codes, heard, prompt_turn)
+                                register_held, tries = jump, attempt + 2
+                                continue
                             break
                         if reason == "stall":
                             log(f"chunk {index + 1}: stalled after {len(pcm) / 88200:.1f}s, making it again")
@@ -930,12 +1204,15 @@ def make_engine(base):
                     if check is not None and frames:
                         pcm, codes = trim_tail(plain(chunk.text), heard, pcm, codes)
                         frames = codes.shape[1]
+                    shape = None
                     if not live and frames and reason != "stall":
-                        pcm, codes = self.tidy_tail(plain(chunk.text), heard, pcm, codes)
-                        frames = codes.shape[1]
+                        if crossfade:  # the chunk is kept whole; its tail fades under the next one
+                            shape = shaped(pcm, codes.shape[1], plain(chunk.text), heard)
+                        else:
+                            pcm, codes = self.tidy_tail(plain(chunk.text), heard, pcm, codes)
+                            frames = codes.shape[1]
                     if not live:
-                        for offset in range(0, len(pcm), PACKET_BYTES):
-                            yield {"type": "speech.audio.delta", "pcm": pcm[offset:offset + PACKET_BYTES]}
+                        yield from send(pcm, shape)
                     if reason in ("length", "stall"):
                         finish = reason
                     if not frames:
@@ -949,6 +1226,13 @@ def make_engine(base):
                 frames_total += record.codes.shape[1]
                 first_audio = first_audio or round((time.perf_counter() - started) * 1000)
                 records.append(record)
+                if register_guard.active():
+                    register_before += register_guard.pcm_openings(record.pcm)
+            if pending is not None:  # the last chunk's tail, faded out (without the pause padding)
+                import numpy as np
+
+                pending = np.trim_zeros(pending, "b")
+                yield from send(b"")
             if not records:
                 raise de.RequestError("no chunk produced audio")
             remember(request.text, LongTake(line=words, chunks=records, direction=direction))
