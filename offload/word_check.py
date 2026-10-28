@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import difflib
 import os
+import re
 import sys
 import threading
 import types
@@ -140,6 +141,47 @@ def missing_tail(check: Check, heard: list[tuple[str, float, float]], stalled: b
         text = " ".join(word.text for word in tail)
         return text if len(letters(text)) >= 4 else None
     return None
+
+
+# drawled is adapted from latent-variable/shipshow's bin/hearback.py, Copyright (c) 2026
+# Lino Valdovinos, under the MIT License
+# (https://github.com/latent-variable/shipshow/blob/main/LICENSE).
+#
+# A take that drags inside a sentence: more than MAX_WORD_GAP s from one word's start to
+# the next word's, in one sentence (latent-variable/shipshow #90, its DESIGN D65). Drama 3
+# read "Like animals." with 3 s between the two words there; the word check passed it at
+# 0.977, and hiss filled the gap, so no silence check saw it. In 1,204 word pairs of their
+# good takes the longest such gap was 1.9 s (a year said out loud). A pause between
+# sentences is a beat and is never judged; here neither is one the script asks for: a
+# [cue] or <tag> between the words, an ellipsis or a dash after the first, or a word given
+# as phonemes (not in the words Whisper is matched to). 0 = off.
+MAX_WORD_GAP = float(os.environ.get("DRAMA3_MAX_WORD_GAP", "2.5"))
+SENTENCE_END = re.compile(r"[.!?。！？]+[\"'”’)\]]*$")
+PAUSE_AFTER = re.compile(r"(\.\.\.|…|—|–|-)[\"'”’)]*$")
+WRITTEN_PAUSE = re.compile(r"\[[^\[\]]*\]|<[^<>]*>|<\|phoneme_start\|>.*?<\|phoneme_end\|>", re.S)
+
+
+def drawled(script: str, heard: list[tuple[str, float, float]]) -> str | None:
+    """'<gap> s between "<a>" and "<b>"' for the longest gap over MAX_WORD_GAP between two
+    words of one sentence, or None."""
+    if MAX_WORD_GAP <= 0 or not heard:
+        return None
+    words, paused = [], []  # the script's spoken words; a pause written before each
+    for number, piece in enumerate(WRITTEN_PAUSE.split(infill.PHONEME.sub("[ ]", script))):
+        for index, token in enumerate(infill.tokens(piece)):
+            words.append(token)
+            paused.append(index == 0 and number > 0)
+    timed = infill.align(" ".join(words), heard)
+    if len(timed) != len(words):
+        return None
+    worst = None
+    for (a, b), written in zip(zip(timed, timed[1:]), paused[1:]):
+        if written or a.start is None or b.start is None or SENTENCE_END.search(a.text) or PAUSE_AFTER.search(a.text):
+            continue
+        gap = b.start - a.start
+        if gap > MAX_WORD_GAP and (worst is None or gap > worst[0]):
+            worst = (gap, a.text, b.text)
+    return None if worst is None else f'{worst[0]:.1f} s between "{worst[1]}" and "{worst[2]}"'
 
 
 def heard_text(heard: list[tuple[str, float, float]]) -> str:
