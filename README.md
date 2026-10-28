@@ -146,6 +146,14 @@ Real time is 21.5 frames per second (46.5 ms per frame); "2x" means a take is ge
 | 5.2 GiB (24 GB card) | 7 whole layers (earlier version) | 22.5 ms | 1.7-1.9x |
 | none | all 40 layers in RAM | 25.8 ms | 1.2-1.5x |
 
+**First audio with a cloned voice.** A clone's prompt is mostly its reference clip, which every take used to read again: 1.5 s of prefill for a 20 s clip, 2.2 s for a 39 s one, against 0.33 s for a random voice. The first take with a voice now keeps the model's state after the clip (in RAM, 77-109 MiB), and later takes with the same voice read only their own rows ([reference prefill cache](#reference-prefill-cache)):
+
+| Voice | First audio, reading the whole prompt | Reusing the clip's prefill |
+| --- | --- | --- |
+| Random (no clip) | 1.33 s | (nothing to reuse) |
+| 20 s clone / 12 s clone | 2.72 s (20 s clip) | **1.27-1.29 s** (12 s clip) |
+| 39 s clone (60 s layout) | 3.41 s | **1.44 s** |
+
 A slower PCIe link (Gen 4, or x8) makes the offloaded experts proportionally slower. The Small GGUF: decode step 12.8 ms, 1.0-2.6x real time on the 5090 (16 GB cards were not measured; expect them to be slower).
 
 <details>
@@ -183,6 +191,16 @@ The Space loads all ~37 GiB of weights onto one GPU. `offload/drama3_offload.py`
 - **20 s and 60 s references.** 60 s references need about 2.2 GiB more working memory, so the cache follows the voice each take uses: on the 5090, 4,157 experts for voices of 20 s or less, 3,144 for longer ones. Clips added while **Allow reference clips up to 60 s** is on are marked "· 60 s" and keep working after you untick it. The switch happens between takes, only when the layout changes: it drops the decode CUDA graphs, re-sizes the cache from pinned RAM and captures them again in about 1 s (5 s the first time). Tested: 5 takes alternating a 38 s and a 10 s voice re-sized it 4 times, all takes complete.
 
 The start log reports the split it chose, for example `[offload] ... 0 of 40 layers fit, plus the 4157 most-used experts of the other 40`.
+
+### Reference prefill cache
+
+`offload/prefix_cache.py`, from drama-tensorfold's engine patch 0012 ([plotarmordev/drama-tensorfold #17](https://github.com/plotarmordev/drama-tensorfold/pull/17)), with the corrections of [BobClawblaw/drama-tensorfold #1](https://github.com/BobClawblaw/drama-tensorfold/pull/1), TensorFold's CUDA version ([plotarmordev/TensorFold #4](https://github.com/plotarmordev/TensorFold/pull/4)) and SGLang Omni's contract for the same cache ([sglang-omni #3235](https://github.com/sgl-project/sglang-omni/pull/3235)). A take's prompt starts with its system turn, which holds a cloned voice's reference clip. That part is read on its own and the model's state after it is kept: the full-attention layers' keys and values, the linear-attention layers' conv windows and recurrent states, and the audio decoder's keys and values, all at the same row, in pinned RAM, for the last 3 voices. A later take whose prompt starts with the same rows (same voice, same instruction) restores it and reads only the rest: the same take again, a retake, the next take with that voice, and a long script's later chunks.
+
+- **The same audio, cache or not.** A prompt with a reference is always read in those two parts, also with `DRAMA3_PREFIX_CACHE=0`, so a take never depends on the cache: seeded takes were byte-identical with the cache off, built, reused, after a random voice's take, after a guided take, after the voice was evicted and kept again, and after the memory layout switched both ways. The cut is not one the Space's prefill makes (it reads 512-row chunks from row 0), and any such cut changes a rounding: tested, a cut at a multiple of 64 changed the audio as well, so takes with a reference differ by a rounding from the ones made before this cache. `DRAMA3_PREFIX_CACHE_ALIGN=512` keeps only whole 512-row chunks, TensorFold's rule, which keeps those bytes but nothing for a clip under about 22 s.
+- **Exact identity.** The kept rows are compared whole, every code column, plus the row after the cut, which labels the audio decoder's state at the cut. A kept state is a copy, so another take or a failed prefill cannot make it stale; it is used only while the model's caches it came from are the ones in use. A voice pushed out by a fourth one hands its RAM buffers to the next instead of pinning new memory.
+- **Not with guidance:** tag and voice guidance read 2-3 versions of the prompt, one without the clip, so those takes (lines with `<tags>` on a clone, and Quality Mode with voice guidance on) read the whole prompt as before.
+- **Where the rest of the time goes:** a 533-row prompt read whole took 1.34 s, 94% of it the MoE kernel reading experts from RAM; the gated delta rule, attention and the rest were under 5%, so capturing that prefill in CUDA graphs ([sglang #46619](https://github.com/sgl-project/sglang/pull/46619)) would gain little here.
+- CUDA backends only (full model and Small GGUF).
 
 ### Pause fix
 
@@ -310,6 +328,9 @@ The Studio's checkboxes and sliders cover most of these; the environment variabl
 | `DRAMA3_EXPERIMENTAL_SAMPLER` | `fixes` | The sampler the Experimental box starts with: `fixes` (the community fixes), `reference` (Fish reference sampling) or `reference_ras` (with the RAS fallback) |
 | `DRAMA3_EPSILON_CUTOFF` | `0.001` | Fish reference sampling's epsilon cutoff on the main token: less probable candidates are never drawn |
 | `DRAMA3_PRONUNCIATION` | `cache/pronunciation.json` | Where the pronunciation dictionary's rules are kept |
+| `DRAMA3_PREFIX_CACHE` | `1` | Reuse a cloned voice's reference prefill across takes (`0` = off; the audio is the same) |
+| `DRAMA3_PREFIX_CACHE_ENTRIES` | `3` | How many voices' prefills are kept (about 0.1 GiB of RAM each) |
+| `DRAMA3_PREFIX_CACHE_ALIGN` | `1` | `512` keeps only whole 512-row prefill chunks: the audio of the engine before the cache, but nothing kept for clips under about 22 s |
 | `DRAMA3_MAX_WORD_GAP` | `2.5` | The drawl check: the longest gap, in seconds from one word's start to the next, inside a sentence (`0` = off) |
 | `DRAMA3_REGISTER_ST` | `6` | The register guard's jump, in semitones above the take's other phrase openings (`0` = off) |
 | `DRAMA3_WARM_UP` | `1` | `0` skips the startup warm-up take (always skipped by the portable engine) |
@@ -435,6 +456,7 @@ The Gradio endpoints are also available through `gradio_client` (`Client("http:/
 - [SGLang Omni #3278](https://github.com/sgl-project/sglang-omni/pull/3278) and [vLLM-Omni #9503](https://github.com/vllm-project/vllm-omni/pull/9503) (stone.li, Apache-2.0) for the rule that keeps residual codes inside the codec's codebooks and for Fish Audio's reference sampling, adapted in `offload/upstream_sampling.py`.
 - Fish Audio's [Drama 3 guide](https://github.com/fishaudio/docs/pull/239) and [pronunciation docs](https://github.com/fishaudio/docs/pull/292) for the paired and language tags, phonemes in scripts, and the pronunciation dictionary's rules.
 - [shipshow](https://github.com/latent-variable/shipshow) (Copyright (c) 2026 Lino Valdovinos, [MIT](https://github.com/latent-variable/shipshow/blob/main/LICENSE)) for the drawl check ([#90](https://github.com/latent-variable/shipshow/pull/90)) and the spelled-out check ([#82](https://github.com/latent-variable/shipshow/pull/82)); `word_check.letter_groups`, `spelled_out` and `drawled` are adapted from its `bin/hearback.py`.
+- [drama-tensorfold #17](https://github.com/plotarmordev/drama-tensorfold/pull/17), [BobClawblaw/drama-tensorfold #1](https://github.com/BobClawblaw/drama-tensorfold/pull/1), [TensorFold #4](https://github.com/plotarmordev/TensorFold/pull/4) and [SGLang Omni #3235](https://github.com/sgl-project/sglang-omni/pull/3235) for the design of the reference prefill cache.
 
 The Space code is Apache-2.0. The vendored fish-speech code keeps its own license (`app/fish_speech/LICENSE`). The model weights are under the [Fish Audio Community License](https://huggingface.co/fishaudio/drama-3/blob/main/LICENSE), version 1.0:
 

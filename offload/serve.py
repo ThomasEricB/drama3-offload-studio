@@ -136,6 +136,10 @@ import tag_guidance  # noqa: E402
 # The drama3-small pause fix, for the full model too: silence is masked from the next draw
 # after DRAMA3_MAX_PAUSE_FRAMES silent frames, and a length guard ends takes that never stop
 SILENCE_CODES = os.environ.get("DRAMA3_SILENCE_CODES", "")
+if not PREVIEW and backend in ("cuda", "small"):
+    import prefix_cache  # noqa: E402
+
+    prefix_cache.install()  # a cloned voice's reference is read once, then reused by the takes after it
 if not PREVIEW:
     if SILENCE_CODES and os.path.isfile(SILENCE_CODES):
         if backend in ("cuda", "small"):
