@@ -88,6 +88,7 @@ Above it, in the same box:
   - The 10 acoustic codebooks draw from at most 30 candidates, and the redraw keeps the token that crosses top-p: SGLang Omni's fixes of 2026-10-20 ([#2810](https://github.com/sgl-project/sglang-omni/pull/2810), [#2890](https://github.com/sgl-project/sglang-omni/pull/2890)).
   - With Quality Mode on, a take with a phrase that jumps far above the voice's pitch is made once more (the register guard of [drama-tensorfold](https://github.com/plotarmordev/drama-tensorfold)).
   - Tested on pause-heavy lines (two cloned voices, 80 takes a side): 70 drones caught instead of 136, 61 takes right first time instead of 51, 17 still missing words after every retry instead of 26. A seed makes a different take with them on.
+- With the box on or off, the 9 residual codebooks never draw a code the codec lacks (it has 1024 per codebook, the heads score 4096; sglang-omni #3278). In testing 0.6% of their draws were past 1023, nearly all in the frame decoded after the end of speech, which is never heard; about one take in eight had one in its audio, always a take that had already gone wrong.
 - **Length Hint** (off by default) adds Drama 3's `[audio tokens: N]` to every line, at 0.8 of the length the words need ([mlx-speech #49](https://github.com/appautomaton/mlx-speech/pull/49)). It steadies the pacing; blind, it was preferred on long takes.
 
 ### Long scripts and edits
@@ -418,6 +419,7 @@ The Gradio endpoints are also available through `gradio_client` (`Client("http:/
 - fcmeyer for the [MLX conversions](https://huggingface.co/fcmeyer/drama-3-MLX-4bit-HQ), and [mlx-audio](https://github.com/Blaizzy/mlx-audio) for the Drama 3 MLX port.
 - T8star's [ComfyUI-Drama3-T8](https://github.com/T8mars/Comfyui-Drama-3) for the idea behind the stall guard.
 - [SGLang Omni](https://github.com/sgl-project/sglang-omni) (Apache-2.0) for the sampler fixes behind the experimental codebook cap and crossing token, found through [Frosty40's B70 Turbo](https://huggingface.co/Frosty40/Drama-3-B70-Turbo-GGUF); [torenyx/drama3-24gb](https://github.com/torenyx/drama3-24gb) for the drone analysis behind the uncut main token and stall retry; [drama-tensorfold](https://github.com/plotarmordev/drama-tensorfold) for the register guard; [bidirectional-voice-claude](https://github.com/gabacool/bidirectional-voice-claude) for resuming cut-off lines and joining paragraph breaks; [mlx-speech](https://github.com/appautomaton/mlx-speech) for the length hint. These are reimplemented here, not copied.
+- [SGLang Omni #3278](https://github.com/sgl-project/sglang-omni/pull/3278) and [vLLM-Omni #9503](https://github.com/vllm-project/vllm-omni/pull/9503) (stone.li, Apache-2.0) for the rule that keeps residual codes inside the codec's codebooks, adapted in `offload/upstream_sampling.py`.
 
 The Space code is Apache-2.0. The vendored fish-speech code keeps its own license (`app/fish_speech/LICENSE`). The model weights are under the [Fish Audio Community License](https://huggingface.co/fishaudio/drama-3/blob/main/LICENSE), version 1.0:
 

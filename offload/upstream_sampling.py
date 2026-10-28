@@ -2,7 +2,8 @@
 
 All are experimental and off by default: the Studio's "Enable Experimental Changes" box
 (set_enabled; DRAMA3_EXPERIMENTAL_SAMPLING=1 starts with them on) turns them on and off
-together, from the next take. Off, every draw is the Space's own, bit for bit.
+together, from the next take. Off, every draw is the Space's own, bit for bit, except a
+codebook code the codec lacks (below).
 
 From torenyx/drama3-24gb:
 
@@ -35,6 +36,12 @@ chance (22 / 21 / 18 / 17 of 78); takes with the head cap were picked worst 7 ti
 without, and a cloned voice's pitch varied less between seeds (Joker: std 9.3 -> 7.3
 semitones). Keeping the crossing token caught more drones (14, and 17 with both, to 8).
 
+With the box on or off, the codebook heads never draw a code past the codec's 1024-entry
+residual codebooks (sglang-omni #3278): the codec clamps such a code to 1023, another
+sound. Here 0.6% of head draws were past it, all but a few in the frame decoded after the
+end of speech, which is never heard; about one take in eight had one in its audio, each
+in a take that had already gone wrong (it ended at once and was made again).
+
 The switches are flag tensors the decode reads at every step, so the captured CUDA graphs
 follow them without being captured again. Applies to the CUDA-graph decode
 (drama3_engine.decode_candidates, which pause_fix and drama3_portable call too) and to the
@@ -49,6 +56,9 @@ import torch
 
 ENABLED = os.environ.get("DRAMA3_EXPERIMENTAL_SAMPLING", "0").strip().lower() in {"1", "true", "yes", "on"}
 CODEBOOK_TOP_K = 30  # sglang-omni audio_decoder.py
+# Codes in each of the codec's 9 residual codebooks (dac/rvq.py codebook_size); the
+# codebook heads score 4096, and the codec clamps a code past 1023 to 1023
+RESIDUAL_CODEBOOK_SIZE = 1024
 _flags: dict[str, dict[str, torch.Tensor]] = {}  # per device, read inside the decode
 RELAXED = False
 
@@ -88,10 +98,13 @@ def set_relaxed(on: bool) -> None:
         value["relaxed"].fill_(RELAXED)
 
 
-def sample(logits, temperature, top_k, top_p, *, keep_crossing=False, no_top_p=False, uncut=False):
+def sample(logits, temperature, top_k, top_p, *, keep_crossing=False, no_top_p=False, uncut=False,
+           legal=None):
     """tower.sample_top_k_top_p. keep_crossing (a bool or a flag tensor) keeps the token
     that crosses top_p; no_top_p (a flag tensor) makes no top-p cut; uncut (a flag tensor)
-    drops no token at all."""
+    drops no token at all; legal (a count) drops ids from legal up after the other rules,
+    keeping the most probable legal id. The other ids keep their odds and the noise is the
+    same, so a draw changes only where an id past legal would have won it."""
     from fish_speech.models.text2semantic.fish_omni.tower import MIN_TEMPERATURE
 
     if isinstance(temperature, torch.Tensor):
@@ -110,6 +123,10 @@ def sample(logits, temperature, top_k, top_p, *, keep_crossing=False, no_top_p=F
     if uncut is not False:
         dropped = dropped & ~uncut
     dropped[..., 0] = False
+    if legal is not None:
+        illegal = ids >= legal
+        dropped = dropped | illegal
+        dropped.scatter_(-1, (~illegal).int().argmax(-1, keepdim=True), False)
     probabilities = values.masked_fill(dropped, -torch.inf).softmax(-1)
     noise = torch.empty_like(probabilities).exponential_()
     choice = (probabilities / noise).argmax(-1, keepdim=True)
@@ -139,7 +156,7 @@ def decode_candidates(tower, candidates, candidate_logits, hidden, positions, fr
     heads_k = torch.where(on, k.clamp(max=CODEBOOK_TOP_K), k)
     for layer, head in zip(tower.residual_layers, tower.codebook_heads):
         hidden = layer(hidden, codes[-1], semantic, positions)
-        codes.append(sample(head(hidden), temperature, heads_k, top_p))
+        codes.append(sample(head(hidden), temperature, heads_k, top_p, legal=RESIDUAL_CODEBOOK_SIZE))
     return torch.stack((main, *codes), dim=-1)
 
 
