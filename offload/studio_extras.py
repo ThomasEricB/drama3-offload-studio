@@ -15,8 +15,10 @@ is built, without changing the Space's files:
 - In the same card: "Read ahead across chunks" (lookahead), "Trim chunk tails" and
   "Crossfade chunk joins" (how chunks join), "Edit by infilling", and subtitles: import an
   .srt as a timed script, download the .srt of the current take.
-- A box of its own between the Voice card and Sampling: "Enable Experimental Changes"
-  (upstream_sampling.py, register_guard.py; off by default), "Length Hint" (off by
+- Between the Voice card and Sampling, an "Experimental" card: "Enable Experimental
+  Changes" (upstream_sampling.py, register_guard.py; off by default) and its sampler (the
+  community fixes or Fish reference sampling), greyed out while the box is off. Under it,
+  a box of its own: "Length Hint" (off by
   default), "Check every word before playing (Quality Mode)" (word_check.py), and folded
   under it like Sampling, its "Voice guidance" strength (tag_guidance.py; full model
   only), greyed out while the check is off.
@@ -57,6 +59,19 @@ UNLOCK_INFO = (
 #   same thin scrollbar gutter, and the mirror spans its wrapper (the textarea's exact width).
 EXTRAS_CSS = """
 #studio-extras-style { display: none; }
+#experimental .exp-sampler { gap: 6px !important; padding: 10px 2px 0; border-top: 1px solid var(--border); }
+#experimental .exp-sampler-off { opacity: 0.4; }
+#experimental .exp-label { font-size: 12px; font-weight: 600; color: var(--muted); letter-spacing: .02em; }
+#experimental-sampler .wrap { display: flex; flex-wrap: nowrap; background: var(--soft); border-radius: 999px;
+  padding: 3px; gap: 3px; }
+#experimental-sampler label { flex: 1; justify-content: center; border: 0; border-radius: 999px; background: transparent;
+  padding: 7px 6px; font-size: 13px; white-space: nowrap; }
+#experimental-sampler input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+#experimental-sampler label.selected, #experimental-sampler label:has(input:checked) { background: var(--card);
+  box-shadow: 0 1px 2px #14141414; }
+@media (max-width: 560px) { #experimental-sampler .wrap { flex-wrap: wrap; border-radius: 16px; } }
+#experimental-sampler-group .hint { padding: 0 8px; }
+#experimental-details .hint li, #experimental-details .hint p { color: var(--muted); font-size: 12.5px; }
 .voice-guidance-off { opacity: 0.4; }
 #script textarea.drama-highlighted { position: relative; z-index: 3; background: transparent !important; }
 .stage-item[role="button"] { cursor: pointer; }
@@ -221,6 +236,37 @@ def stage_script(text: str) -> str:
     return text
 
 
+# The Experimental card's sampler switch: short names, and a line about the one picked
+SAMPLER_LABELS = {"fixes": "Community fixes", "reference": "Fish reference", "reference_ras": "Fish reference + RAS"}
+SAMPLER_HINTS = {
+    "fixes": "The tested default: the changes under *What changes*. 70 drones instead of 136 on pause-heavy lines.",
+    "reference": "Fish Audio's own rule (SGLang Omni #3278): epsilon sampling on the main token, and a repeated draw "
+                 "becomes the most probable one. Here it made more drones (7 to 1 in 10 takes) and lost blind, 3 to 5.",
+    "reference_ras": "Fish reference, with a repeated draw redrawn at temperature 1.0, top-p 0.95, top-k 30 instead "
+                     "of the most probable one. Not tested here.",
+}
+EXPERIMENTAL_DETAILS = """**From the next take, with the box on:**
+
+- The main token is drawn with no top-p cut: top-p 0.9 cut a drone's way out, the end of speech \
+  ([torenyx/drama3-24gb](https://github.com/torenyx/drama3-24gb)).
+- A remake after a stall also loosens its repeat-avoiding redraw (same source).
+- The 9 acoustic codebooks draw from at most 30 candidates, and the redraw keeps the token that crosses top-p \
+  (SGLang Omni [#2810](https://github.com/sgl-project/sglang-omni/pull/2810), \
+  [#2890](https://github.com/sgl-project/sglang-omni/pull/2890)).
+- With Quality Mode on, a take whose phrase jumps far above the voice's pitch is made once more \
+  ([drama-tensorfold](https://github.com/plotarmordev/drama-tensorfold)'s register guard).
+- The sampler above applies them with the community fixes or with Fish Audio's reference sampling.
+
+**Always, box on or off:** no acoustic code the codec lacks is drawn (it has 1,024 per codebook, the model scores 4,096).
+
+Tested on pause-heavy lines (two cloned voices, 80 takes a side): 70 drones caught instead of 136, 61 takes right first
+time instead of 51."""
+
+
+def sampler_classes(on: bool) -> list[str]:
+    return ["exp-sampler"] + ([] if on else ["exp-sampler-off"])
+
+
 SAMPLING_DEFAULTS = {"Temperature": 0.7, "Top-p": 0.7, "Top-k": 30} if SMALL else {}
 NOTE_PLACEHOLDER_SPACE = "e.g. more amused than before; drop the hurt"
 NOTE_PLACEHOLDER = "e.g. more amused than before · or leave empty and edit the script to re-read it"
@@ -342,21 +388,31 @@ def extended_studio():
     def guidance_classes(checked):
         return ["voice-guidance"] + ([] if checked else ["voice-guidance-off"])
 
+    def experimental_controls(sampling):
+        """"Enable Experimental Changes", its sampler (a switch like the Voice card's), a
+        line about the sampler picked, and the details folded away."""
+        on = bool(sampling and sampling.ENABLED)
+        gr.HTML('<div class="card-head"><h2>Experimental</h2></div>')
+        found["experimental_box"] = gr.Checkbox(
+            value=on, label="Enable Experimental Changes", container=False,
+            info="Sampler changes from others' findings, off by default: half as many drones on pause-heavy lines "
+                 "in testing. A seed makes a different take with them on.")
+        with gr.Column(elem_classes=sampler_classes(on), elem_id="experimental-sampler-group") as group:
+            found["sampler_group"] = group
+            gr.HTML('<span class="exp-label">Sampler</span>', padding=False, container=False)
+            found["sampler_box"] = gr.Radio(
+                [(SAMPLER_LABELS[name], name) for name in sampling.SAMPLERS] if sampling else [],
+                value=sampling.SAMPLER if sampling else None, show_label=False, container=False,
+                interactive=on, elem_id="experimental-sampler")
+            found["sampler_hint"] = gr.Markdown(SAMPLER_HINTS.get(sampling.SAMPLER if sampling else "", ""),
+                                                elem_classes="hint")
+        with gr.Accordion("What changes", open=False, elem_id="experimental-details"):
+            gr.Markdown(EXPERIMENTAL_DETAILS, elem_classes="hint")
+
     def word_check_controls():
-        """"Check every word" and its voice guidance (folded away, like Sampling)."""
+        """Length Hint, "Check every word" and its voice guidance (folded away, like Sampling)."""
         # (a folded Accordion's contents are not rendered, so the style is outside it)
         gr.HTML(f"<style>{EXTRAS_CSS}</style>", padding=False, container=False, elem_id="studio-extras-style")
-        sampling = sys.modules.get("upstream_sampling")  # not with the MLX backend
-        found["experimental_box"] = gr.Checkbox(
-            value=bool(sampling and sampling.ENABLED), label="Enable Experimental Changes",
-            visible=sampling is not None,
-            info="Four sampler changes from others' findings: the main token is drawn with no top-p cut (top-p "
-                 "0.9 cuts a drone's way out, the end of speech), and a remake after a stall also loosens its "
-                 "repeat-avoiding redraw (torenyx/drama3-24gb); the 10 acoustic codebooks draw from at most 30 "
-                 "candidates, and the redraw keeps the token that crosses top-p (SGLang Omni). On pause-heavy "
-                 "lines, half as many drones and more takes right first time. With Quality Mode on, a take whose "
-                 "phrase jumps far above the voice's pitch is also made once more (drama-tensorfold's register "
-                 "guard). A seed makes a different take with them on.")
         found["hint_box"] = gr.Checkbox(
             value=long_takes.SETTINGS["length_hint"], label="Length Hint (Might improve short generations)",
             info="Each line tells the model about how long it should take, from its words (Drama 3's "
@@ -382,7 +438,11 @@ def extended_studio():
     def on_accordion(self, *args, **kwargs):
         label = args[0] if args else kwargs.get("label")
         if label == "Sampling" and "word_box" not in found:
-            # A box of its own between the Voice card and Sampling
+            # Cards of their own between the Voice card and Sampling: the experimental
+            # sampling (not with the MLX backend), then Length Hint and Quality Mode
+            sampling = sys.modules.get("upstream_sampling")
+            with gr.Column(elem_classes="card", elem_id="experimental", visible=sampling is not None):
+                experimental_controls(sampling)
             with gr.Column(elem_classes="card", elem_id="word-check"):
                 word_check_controls()
         accordion_init(self, *args, **kwargs)
@@ -508,14 +568,34 @@ def extended_studio():
             tidy_box.change(setting("tail_tidy"), inputs=tidy_box, queue=False, api_visibility="private")
             crossfade_box.change(setting("crossfade"), inputs=crossfade_box, queue=False, api_visibility="private")
             word_box.change(setting("word_check"), inputs=word_box, queue=False, api_visibility="private")
-            experimental_box, hint_box = found["experimental_box"], found["hint_box"]
+            experimental_box, hint_box, sampler_box = found["experimental_box"], found["hint_box"], found["sampler_box"]
             hint_box.change(setting("length_hint"), inputs=hint_box, queue=False, api_visibility="private")
+
+            sampler_group, sampler_hint = found["sampler_group"], found["sampler_hint"]
+
+            def experimental_state():
+                """The switch greyed out while the box is off: the sampler is used with it on only."""
+                sampling = sys.modules.get("upstream_sampling")
+                on, name = bool(getattr(sampling, "ENABLED", False)), getattr(sampling, "SAMPLER", None)
+                return (gr.Checkbox(value=on), gr.Radio(value=name, interactive=on),
+                        gr.Column(elem_classes=sampler_classes(on)), SAMPLER_HINTS.get(name, ""))
 
             def set_experimental(value):
                 if (sampling := sys.modules.get("upstream_sampling")) is not None:
                     sampling.set_enabled(bool(value))
+                return experimental_state()[1:]
 
-            experimental_box.change(set_experimental, inputs=experimental_box, queue=False, api_visibility="private")
+            experimental_outputs = [sampler_box, sampler_group, sampler_hint]
+            experimental_box.change(set_experimental, inputs=experimental_box, outputs=experimental_outputs,
+                                    queue=False, api_visibility="private")
+
+            def set_sampler(value):
+                if (sampling := sys.modules.get("upstream_sampling")) is not None and value:
+                    sampling.set_sampler(value)
+                return SAMPLER_HINTS.get(value, "")
+
+            sampler_box.change(set_sampler, inputs=sampler_box, outputs=sampler_hint, queue=False,
+                               api_visibility="private")
 
             def guidance_state(checked):  # greyed out while the word check is off: it does nothing then
                 return (gr.Accordion(elem_classes=guidance_classes(checked)),
@@ -551,12 +631,13 @@ def extended_studio():
                         gr.Checkbox(value=long_takes.SETTINGS["crossfade"]),
                         gr.Checkbox(value=long_takes.SETTINGS["word_check"]),
                         gr.Slider(value=long_takes.SETTINGS["voice_guidance"]),
-                        gr.Checkbox(value=bool(getattr(sys.modules.get("upstream_sampling"), "ENABLED", False))),
                         gr.Checkbox(value=long_takes.SETTINGS["length_hint"]))
 
             Context.root_block.load(current_settings,
                                     outputs=[found["unlock"], found["ref_hint"], enabled, lookahead, infill_box, tidy_box,
-                                             crossfade_box, word_box, voice_slider, experimental_box, hint_box],
+                                             crossfade_box, word_box, voice_slider, hint_box],
+                                    queue=False, api_visibility="private")
+            Context.root_block.load(experimental_state, outputs=[experimental_box, *experimental_outputs],
                                     queue=False, api_visibility="private")
             Context.root_block.load(lambda: guidance_state(long_takes.SETTINGS["word_check"]), outputs=guidance,
                                     queue=False, api_visibility="private")
