@@ -143,8 +143,8 @@ def missing_tail(check: Check, heard: list[tuple[str, float, float]], stalled: b
     return None
 
 
-# drawled is adapted from latent-variable/shipshow's bin/hearback.py, Copyright (c) 2026
-# Lino Valdovinos, under the MIT License
+# drawled, letter_groups and spelled_out are adapted from latent-variable/shipshow's
+# bin/hearback.py, Copyright (c) 2026 Lino Valdovinos, under the MIT License
 # (https://github.com/latent-variable/shipshow/blob/main/LICENSE).
 #
 # A take that drags inside a sentence: more than MAX_WORD_GAP s from one word's start to
@@ -182,6 +182,70 @@ def drawled(script: str, heard: list[tuple[str, float, float]]) -> str | None:
         if gap > MAX_WORD_GAP and (worst is None or gap > worst[0]):
             worst = (gap, a.text, b.text)
     return None if worst is None else f'{worst[0]:.1f} s between "{worst[1]}" and "{worst[2]}"'
+
+
+# Letters spelled out (latent-variable/shipshow #82, its DESIGN D60): Drama 3 read the
+# respelling "en" as the letters E, N on nearly every line of a script there, and the
+# word check passed it, as "EN" and "en" are the same letters lowercased. Whisper writes
+# letters it hears spelled out as capitals ("EN", "E N", "E.N."): a group of them the
+# script does not spell (as written, in capitals) is a fault. A capital A or I alone is a
+# word. Whisper writes "okay" as "OK"; that one is allowed. 0 faults in 51 takes here.
+LETTER_WORDS = {"A", "I"}
+ALWAYS_ALLOWED = {"OK"}
+
+
+def letter_groups(text: str) -> list[str]:
+    """Runs of capital letters, as Whisper writes letters it hears spelled out: "EN",
+    "E.N.", "E-N" and "E N" are each "EN". A word of several capitals is one group; single
+    capitals side by side, with no punctuation between them, join into one ("A" and "I"
+    alone only join a neighbour that is a letter too)."""
+    groups, run = [], ""
+    for token in re.findall(r"\S+", text):
+        core = re.sub(r"^[^A-Za-z0-9]+|[^A-Za-z0-9.'-]+$", "", token)
+        letters_only = re.sub(r"[.'-]", "", core)
+        broken = bool(re.search(r"[,;:!?]$", token)) or (token.endswith(".") and not re.fullmatch(r"([A-Z]\.)+", token))
+        if re.fullmatch(r"[A-Z]", letters_only) and (letters_only not in LETTER_WORDS or run):
+            run += letters_only
+        elif re.fullmatch(r"[A-Z]{2,}", letters_only):
+            if len(run) >= 2:
+                groups.append(run)
+            groups.append(letters_only)
+            run = ""
+            continue
+        else:
+            if len(run) >= 2:
+                groups.append(run)
+            run = ""
+            continue
+        if broken:
+            if len(run) >= 2:
+                groups.append(run)
+            run = ""
+    if len(run) >= 2:
+        groups.append(run)
+    return groups
+
+
+def spelled_out(script: str, heard: list[tuple[str, float, float]]) -> list[str]:
+    """Letter groups Whisper heard that the script never spells, in order, once each."""
+    written = re.sub(r"\[[^\[\]]*\]|<[^<>]*>", " ", infill.PHONEME.sub(" ", script))
+    allowed = set(letter_groups(written)) | ALWAYS_ALLOWED
+    # letters the script spells with dots, in any case ("n.p.c."): asked for
+    allowed.update(re.sub(r"\.", "", group).upper() for group in re.findall(r"(?:[A-Za-z]\.){2,}", written))
+    for word in re.findall(r"[A-Za-z][A-Za-z0-9'-]*", written):  # "OpenAI": "AI" and "OPENAI"
+        allowed.update(re.findall(r"[A-Z]{2,}", word))
+        if len(re.findall(r"[A-Z]", word)) >= 2:
+            allowed.add(re.sub(r"[^A-Za-z]", "", word).upper())
+    return [group for group in dict.fromkeys(letter_groups(heard_text(heard))) if group not in allowed]
+
+
+def fault(script: str, heard: list[tuple[str, float, float]]) -> str | None:
+    """Why a take that said its words is still made again (a drawl, letters spelled out), or None."""
+    if (drawl := drawled(script, heard)) is not None:
+        return f"drawled: {drawl}"
+    if spelled := spelled_out(script, heard):
+        return "spelled out " + ", ".join(f'"{group}"' for group in spelled)
+    return None
 
 
 def heard_text(heard: list[tuple[str, float, float]]) -> str:

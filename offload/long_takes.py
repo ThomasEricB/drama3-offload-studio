@@ -21,7 +21,8 @@
   continuation of it (make_rest): when streamed, once it is made; in Quality Mode, before
   it is made again from scratch.
 - A take or held chunk that drawls (word_check.drawled: over 2.5 s between two words of
-  one sentence) is made again, as one missing words; a streamed one is only logged.
+  one sentence) or spells letters out (word_check.spelled_out) is made again, as one
+  missing words; a streamed one is only logged.
 - Scripts may give words as phonemes (<|phoneme_start|>…<|phoneme_end|>, the only <|token|>
   let through), and the pronunciation dictionary (pronunciation.py) applies to every one.
 - Line breaks inside a line are sent as spaces (one_line), and an optional length hint
@@ -684,8 +685,8 @@ def make_engine(base):
             None when the take said everything."""
             heard = yield from keepalive(check.hear, pcm)
             tail = word_check.missing_tail(check, heard, stalled=done.get("finish_reason") == "stall")
-            if (drawl := word_check.drawled(check.script, heard)) is not None:
-                word_check.log(f"the take drawled: {drawl} (streamed, so kept; Quality Mode makes it again)")
+            if (fault := word_check.fault(check.script, heard)) is not None:
+                word_check.log(f"the take {fault} (streamed, so kept; Quality Mode makes it again)")
             if tail is None:
                 return None
             word_check.log(f"the take ended before {tail!r}; making the rest")
@@ -765,11 +766,10 @@ def make_engine(base):
                         score = check.score(heard)
                         word_check.log(f"take {attempt + 1} with the rest: {score:.2f} heard "
                                        f"{word_check.heard_text(heard)[:80]!r}")
-                drawl = word_check.drawled(check.script, heard) if score >= word_check.PASS else None
-                if drawl:
-                    word_check.log(f"take {attempt + 1} drawled: {drawl}"
-                                   f"{'; making it again' if attempt + 1 < tries else ''}")
-                passed = score >= word_check.PASS and not drawl
+                fault = word_check.fault(check.script, heard) if score >= word_check.PASS else None
+                if fault:
+                    word_check.log(f"take {attempt + 1} {fault}{'; making it again' if attempt + 1 < tries else ''}")
+                passed = score >= word_check.PASS and not fault
                 jump = register_guard.pcm_jump(bytes(pcm)) if register and passed else None
                 if register_held is not None:  # the register guard's remake
                     if passed and (jump or 0.0) < register_held:
@@ -778,8 +778,8 @@ def make_engine(base):
                     else:
                         log("the remake is no better; the first take is kept")
                     break
-                if best is None or (not drawl, score) > best_rank:  # a take that drawled only if all did
-                    best, best_rank = (score, bytes(pcm), done, codes, heard), (not drawl, score)
+                if best is None or (not fault, score) > best_rank:  # a faulty take only if all were
+                    best, best_rank = (score, bytes(pcm), done, codes, heard), (not fault, score)
                 if passed:
                     if jump:
                         log(f"a phrase opens {jump:.1f} semitones above the others (register guard), "
@@ -1182,13 +1182,14 @@ def make_engine(base):
                                     word_check.log(f"chunk {index + 1} take {attempt + 1} with the rest: "
                                                    f"{listener.score(heard):.2f} heard "
                                                    f"{word_check.heard_text(heard)[:80]!r}")
-                        # A held chunk that drawled is made again, as one that missed words
-                        drawl = (word_check.drawled(listener.script, heard)
+                        # A held chunk that drawled or spelled letters out is made again, as one
+                        # that missed words
+                        fault = (word_check.fault(listener.script, heard)
                                  if listener is not None and heard is not None and score >= word_check.PASS else None)
-                        if drawl:
-                            word_check.log(f"chunk {index + 1} take {attempt + 1} drawled: {drawl}"
+                        if fault:
+                            word_check.log(f"chunk {index + 1} take {attempt + 1} {fault}"
                                            f"{' (streamed, so kept)' if live else ''}")
-                        passed = score >= word_check.PASS and not drawl
+                        passed = score >= word_check.PASS and not fault
                         jump = (register_guard.pcm_jump(pcm, register_before)
                                 if register and frames and passed else None)
                         if register_held is not None:  # the register guard's remake
@@ -1198,9 +1199,9 @@ def make_engine(base):
                             else:
                                 log(f"chunk {index + 1}: the remake is no better; the first take is kept")
                             break
-                        if best is None or (not drawl, score) > best_rank:  # a drawled take only if all did
+                        if best is None or (not fault, score) > best_rank:  # a faulty take only if all were
                             best = (score, frames, reason, pcm, codes, heard, prompt_turn)
-                            best_rank = (not drawl, score)
+                            best_rank = (not fault, score)
                         if live or passed:
                             if jump:
                                 log(f"chunk {index + 1}: a phrase opens {jump:.1f} semitones above the others "
@@ -1211,10 +1212,10 @@ def make_engine(base):
                             break
                         if reason == "stall":
                             log(f"chunk {index + 1}: stalled after {len(pcm) / 88200:.1f}s, making it again")
-                        if check is None and reason != "stall" and not drawl:
+                        if check is None and reason != "stall" and not fault:
                             break
-                        if drawl and attempt + 1 < tries:
-                            log(f"chunk {index + 1}: drawled, making it again")
+                        if fault and attempt + 1 < tries:
+                            log(f"chunk {index + 1}: {fault.split(':')[0]}, making it again")
                         if attempt + 1 == tries and check is not None and streaming and following:
                             # Every take missed its words while shown the next chunk: the
                             # model may be voicing that chunk here (then said again by its
