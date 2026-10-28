@@ -24,6 +24,7 @@ import re
 import torch
 import torch.nn.functional as F
 
+import infill
 import stall_guard
 
 MAX_PAUSE_FRAMES = int(os.environ.get("DRAMA3_MAX_PAUSE_FRAMES", 10))
@@ -82,6 +83,10 @@ def expected_frames(text: str) -> float:
     if text.startswith("Direction:") and "\nLine:" in text:
         text = text.split("\nLine:", 1)[1]
     text = HINTS.sub(" ", text)  # not spoken: no pause or tag time
+    # A word given as phonemes takes about one letter's time per sound (Arpabet / pinyin
+    # symbols are spaced; IPA is one per character, less its stress and length marks)
+    text = infill.PHONEME.sub(lambda m: "x" * (len(m[1].split()) if " " in m[1].strip()
+                                                else len(re.sub(r"[ˈˌː.]", "", m[1]))), text)
     cjk = latin = spans = 0
     square = angle = 0
     for char in text:

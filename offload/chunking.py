@@ -17,7 +17,8 @@ CHUNK_MAX_FRAMES = 600  # frames per chunk, about 28 s at 21.5 frames/s (as fish
 WHITE = " \t\r\n 　"
 SENTENCE_ENDS = ".!?;。！？；…\n"
 CLAUSE_MARKS = ",:，：、"
-PROTECTED = re.compile(r"<\|[^|>]*\|>|<([A-Za-z][\w-]*)\b[^>]*>.*?</\1>|\[[^\[\]]*\]", re.S)
+PROTECTED = re.compile(r"<\|phoneme_start\|>.*?<\|phoneme_end\|>|<\|[^|>]*\|>|<([A-Za-z][\w-]*)\b[^>]*>.*?</\1>"
+                       r"|\[[^\[\]]*\]", re.S)
 
 
 def size(text: str) -> int:

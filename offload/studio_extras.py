@@ -22,6 +22,10 @@ is built, without changing the Space's files:
   default), "Check every word before playing (Quality Mode)" (word_check.py), and folded
   under it like Sampling, its "Voice guidance" strength (tag_guidance.py; full model
   only), greyed out while the check is off.
+- Direction tags: the paired tags and language tags of Fish Audio's Drama 3 guide
+  (fishaudio/docs #239: soft, fast, stress, forceful; french, spanish, ...), and a chip
+  that gives a word as phonemes (<|phoneme_start|>...<|phoneme_end|>, IPA or Arpabet:
+  fishaudio/docs #292); "How to direct" shows both.
 - Sampling: the seed (seeds.py), a field that opens empty: a new random seed per take
   (a Retake keeps its take's); a number in it (typed, the last take's, or a new one) is
   kept for every take. Each take shows its seed in the stage: a click on it keeps it.
@@ -31,6 +35,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import json
 import os
 import sys
 from pathlib import Path
@@ -59,6 +64,15 @@ UNLOCK_INFO = (
 #   same thin scrollbar gutter, and the mirror spans its wrapper (the textarea's exact width).
 EXTRAS_CSS = """
 #studio-extras-style { display: none; }
+/* Direction tags: a label column wide enough for "Language" and "Pronounce", with a gap
+   before the chips, and chips that wrap within their own column (the label, taken out of
+   the row's flow, sits on the row's first line) */
+#direction-tags .palette { position: relative; padding-left: 104px !important; }
+#direction-tags .palette > .block { position: absolute !important; left: 0; top: 0; width: 96px !important;
+  min-width: 96px !important; height: 25px; padding: 0 !important; margin: 0 !important; overflow: hidden; }
+#direction-tags .palette > .block * { padding: 0 !important; margin: 0 !important; }
+#direction-tags .palette .plabel { display: block; width: 96px; line-height: 25px; white-space: nowrap; }
+#direction-tags .palette + .palette { margin-top: 6px !important; }
 #experimental .exp-sampler { gap: 6px !important; padding: 10px 2px 0; border-top: 1px solid var(--border); }
 #experimental .exp-sampler-off { opacity: 0.4; }
 #experimental .exp-label { font-size: 12px; font-weight: 600; color: var(--muted); letter-spacing: .02em; }
@@ -236,6 +250,51 @@ def stage_script(text: str) -> str:
     return text
 
 
+# Fish Audio's Drama 3 guide (fishaudio/docs #239): the paired tags the model supports,
+# beyond the Space's whisper / slow / emphasis, and its language tags (experimental there)
+SCOPED_TAGS_MORE = ["soft", "fast", "stress", "forceful"]
+LANGUAGE_TAGS = ["french", "spanish", "german", "italian", "japanese", "chinese", "korean"]
+HOW_TO_DIRECT_SPACE = "**Point tag:**"
+HOW_TO_DIRECT_MORE = (
+    "\n\n**Language** (experimental): `He bowed and said <japanese>ありがとうございました</japanese> before he left.`"
+    "\n\n**Pronunciation:** `I am an <|phoneme_start|>ˈɛndʒəˈnɪr<|phoneme_end|>.` IPA in any language, or CMU "
+    "Arpabet (`EH0 N JH AH0 N IH1 R`, the digit is the stress), pinyin, romaji. Select phonemes you typed and "
+    "click **phonemes** to wrap them.")
+
+
+def content_json(text: str) -> str:
+    """studio_content.json with the guide's paired tags in the Span row."""
+    try:
+        content = json.loads(text)
+        content["SCOPED_TAGS"] += [tag for tag in SCOPED_TAGS_MORE if tag not in content["SCOPED_TAGS"]]
+        return json.dumps(content, ensure_ascii=False)
+    except (ValueError, KeyError, TypeError):
+        print("[studio] direction tags: studio_content.json changed, no extra paired tags", flush=True)
+        return text
+
+
+# studio.js: the phonemes chip wraps the selection in phoneme markers, and the script's
+# highlighting shows the markers as tags
+STUDIO_JS = [
+    ("    let snippet = kind === 'scope' ?",
+     "    let snippet = kind === 'phoneme' ? `<|phoneme_start|>${selected || 'phonemes here'}<|phoneme_end|>` :\n"
+     "      kind === 'scope' ?"),
+    ("    result = result.replace(/&lt;(\\/?[A-Za-z][\\w-]*)&gt;/g,",
+     "    result = result.replace(/&lt;\\|phoneme_(start|end)\\|&gt;/g, "
+     "'<span class=\"h-tag\">&lt;|phoneme_$1|&gt;</span>');\n"
+     "    result = result.replace(/&lt;(\\/?[A-Za-z][\\w-]*)&gt;/g,"),
+]
+
+
+def studio_js(text: str) -> str:
+    if all(text.count(old) == 1 for old, _ in STUDIO_JS):
+        for old, new in STUDIO_JS:
+            text = text.replace(old, new)
+    else:
+        print("[studio] phonemes chip: studio.js changed, it inserts a [phonemes] cue instead", flush=True)
+    return text
+
+
 # The Experimental card's sampler switch: short names, and a line about the one picked
 SAMPLER_LABELS = {"fixes": "Community fixes", "reference": "Fish reference", "reference_ras": "Fish reference + RAS"}
 SAMPLER_HINTS = {
@@ -383,7 +442,13 @@ def extended_studio():
     @functools.wraps(read_text)
     def on_read_text(self, *args, **kwargs):
         text = read_text(self, *args, **kwargs)
-        return stage_script(text) if self.name == "stage.js" else text
+        if self.name == "stage.js":
+            return stage_script(text)
+        if self.name == "studio.js":
+            return studio_js(text)
+        if self.name == "studio_content.json":
+            return content_json(text)
+        return text
 
     def guidance_classes(checked):
         return ["voice-guidance"] + ([] if checked else ["voice-guidance-off"])
@@ -445,7 +510,20 @@ def extended_studio():
                 experimental_controls(sampling)
             with gr.Column(elem_classes="card", elem_id="word-check"):
                 word_check_controls()
+        if label == "How to direct" and "tags_box" in found and "extra_chips" not in found:
+            extra_chips()  # the Direction tags accordion is complete: rows of its own after the Space's
         accordion_init(self, *args, **kwargs)
+        if label == "Direction tags":
+            found["tags_box"] = self
+
+    def extra_chips():
+        found["extra_chips"] = chips = []
+        with found["tags_box"]:
+            for title, tags, kind in (("Language", LANGUAGE_TAGS, "scope"), ("Pronounce", ["phonemes"], "phoneme")):
+                with gr.Row(elem_classes=["palette", "scope"]):
+                    gr.HTML(f'<span class="plabel">{title}</span>', min_width=60, scale=0)
+                    for tag in tags:
+                        chips.append((gr.Button(tag, size="sm", min_width=40, elem_classes="chip"), tag, kind))
 
     def seed_controls():
         """The seed, in Sampling after Top-k (seeds.py): the SEED_WIDGET control (driven by
@@ -488,6 +566,8 @@ def extended_studio():
 
     @functools.wraps(markdown_init)
     def on_markdown(self, value=None, *args, **kwargs):
+        if isinstance(value, str) and value.startswith(HOW_TO_DIRECT_SPACE):
+            value += HOW_TO_DIRECT_MORE
         if isinstance(value, str) and value.startswith(REF_HINT_SPACE):
             markdown_init(self, ref_hint(), *args, **kwargs)
             unlock = gr.Checkbox(value=long_takes.SETTINGS["ref_unlocked"], label="Allow reference clips up to 60 s",
@@ -610,6 +690,9 @@ def extended_studio():
             voice_slider.change(set_voice_guidance, inputs=voice_slider, queue=False, api_visibility="private")
             srt_in.upload(import_srt, inputs=srt_in, outputs=script, api_visibility="private")
             srt_out.click(export_srt, inputs=current, outputs=srt_file, api_visibility="private")
+            for button, tag, kind in found.get("extra_chips", []):
+                button.click(None, inputs=script, outputs=script, queue=False, api_visibility="private",
+                             js=f"(text) => window.dramaInsert(text, {json.dumps(tag)}, {json.dumps(kind)})")
 
             def toggle(value):
                 long_takes.SETTINGS["long_retake"] = bool(value)

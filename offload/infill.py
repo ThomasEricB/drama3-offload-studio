@@ -31,6 +31,9 @@ VERIFY_MIN = 0.5  # share of the new window's letters Whisper must hear afterwar
 # avoided a repeated phrase that "before" made (word match 0.994 vs 0.985).
 INSERT_CONTEXT = "both"
 WHOLE_SLACK = 0.05  # the edited chunk may match its script this much worse than the old one did
+# A word given as phonemes (Arpabet, pinyin, romaji or IPA): its spelling is not in the
+# script, so the checks and alignments here leave it out
+PHONEME = re.compile(r"<\|phoneme_start\|>([^<>|\n]+?)<\|phoneme_end\|>")
 
 
 def log(message: str) -> None:
@@ -42,8 +45,9 @@ def _cjk(char: str) -> bool:
 
 
 def tokens(text: str) -> list[str]:
-    """Spoken words: [cues] and <tags> removed; CJK characters are words of their own."""
-    text = re.sub(r"\[[^\[\]]*\]|<[^<>]*>", " ", text)
+    """Spoken words: [cues], <tags> and words given as phonemes removed; CJK characters
+    are words of their own."""
+    text = re.sub(r"\[[^\[\]]*\]|<[^<>]*>", " ", PHONEME.sub(" ", text))
     out: list[str] = []
     for part in text.split():
         word = ""

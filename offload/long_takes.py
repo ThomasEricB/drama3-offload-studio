@@ -20,6 +20,8 @@
 - A take or chunk that ends before its last words, or stalls, gets them made as a
   continuation of it (make_rest): when streamed, once it is made; in Quality Mode, before
   it is made again from scratch.
+- Scripts may give words as phonemes (<|phoneme_start|>…<|phoneme_end|>, the only <|token|>
+  let through).
 - Line breaks inside a line are sent as spaces (one_line), and an optional length hint
   (length_hint) asks for about as long as the words need.
 
@@ -1290,7 +1292,23 @@ def install_server(server) -> None:
     def lenient_clean_text(value, what, limit, *, single_line=False):
         if what == "note" and not (value or "").strip():
             return ""  # an empty note asks for an edit
-        return clean_text(value, what, limit, single_line=single_line)
+        if what != "script":
+            return clean_text(value, what, limit, single_line=single_line)
+        # A script may give words as phonemes (<|phoneme_start|>...<|phoneme_end|>, which
+        # Drama 3 reads); any other <|token|> is still refused.
+        spans = []
+
+        def held(match):
+            spans.append(match.group())
+            return f"\0{len(spans) - 1}\0"
+
+        value = infill.PHONEME.sub(held, value or "")
+        if server.STRUCTURAL.search(value):
+            raise server.HTTPException(400, "Remove the <|…|> tokens from the script, except words given as "
+                                            "<|phoneme_start|>phonemes<|phoneme_end|>; this page writes the others "
+                                            "itself.")
+        value = clean_text(value, what, limit, single_line=single_line)
+        return re.sub(r"\0(\d+)\0", lambda match: spans[int(match[1])], value)
 
     def edit_or_retake(line: str, note: str) -> str:
         return line if not note else retake_text(line, note)
