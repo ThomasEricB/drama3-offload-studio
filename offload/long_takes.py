@@ -136,7 +136,10 @@ def parse_retake(text: str) -> tuple[str | None, str]:
 
 # Line breaks inside a line are sent as spaces (the chunker still cuts at them): with blank
 # lines in its text Drama 3 stopped emitting end of speech and drew ~47 s of silence
-# (gabacool/bidirectional-voice-claude #24). DRAMA3_ONE_LINE=0 sends them as written.
+# (gabacool/bidirectional-voice-claude #24). Every Unicode line break counts, as in
+# mlx-audio #1055: a lone \r or U+2028 pasted from elsewhere is one too. DRAMA3_ONE_LINE=0
+# sends them as written.
+LINE_BREAK = re.compile(r"[ \t]*[\n\r\v\f\x85\u2028\u2029]\s*")
 ONE_LINE = os.environ.get("DRAMA3_ONE_LINE", "1").strip().lower() in {"1", "true", "yes", "on"}
 # The length hint (Drama 3's "[audio tokens: N]", technical report Table 10) on every
 # turn, at LENGTH_HINT_RATIO of the pause fix's estimate (finished takes ran a median 0.67
@@ -149,7 +152,7 @@ LENGTH_HINT_RATIO = float(os.environ.get("DRAMA3_LENGTH_HINT_RATIO", 0.8))
 
 
 def one_line(text: str) -> str:
-    return re.sub(r"[ \t]*\n\s*", " ", text).strip() if ONE_LINE else text
+    return LINE_BREAK.sub(" ", text).strip() if ONE_LINE else text
 
 
 def length_hint(text: str) -> str:
