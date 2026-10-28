@@ -21,7 +21,7 @@
   continuation of it (make_rest): when streamed, once it is made; in Quality Mode, before
   it is made again from scratch.
 - Scripts may give words as phonemes (<|phoneme_start|>…<|phoneme_end|>, the only <|token|>
-  let through).
+  let through), and the pronunciation dictionary (pronunciation.py) applies to every one.
 - Line breaks inside a line are sent as spaces (one_line), and an optional length hint
   (length_hint) asks for about as long as the words need.
 
@@ -42,6 +42,7 @@ import torch
 
 import chunking
 import infill
+import pronunciation
 import register_guard
 import seeds
 import subtitles
@@ -1295,7 +1296,8 @@ def install_server(server) -> None:
         if what != "script":
             return clean_text(value, what, limit, single_line=single_line)
         # A script may give words as phonemes (<|phoneme_start|>...<|phoneme_end|>, which
-        # Drama 3 reads); any other <|token|> is still refused.
+        # Drama 3 reads); any other <|token|> is still refused. Then the pronunciation
+        # dictionary's rules apply.
         spans = []
 
         def held(match):
@@ -1308,7 +1310,8 @@ def install_server(server) -> None:
                                             "<|phoneme_start|>phonemes<|phoneme_end|>; this page writes the others "
                                             "itself.")
         value = clean_text(value, what, limit, single_line=single_line)
-        return re.sub(r"\0(\d+)\0", lambda match: spans[int(match[1])], value)
+        value = re.sub(r"\0(\d+)\0", lambda match: spans[int(match[1])], value)
+        return pronunciation.dictionary().apply(value)
 
     def edit_or_retake(line: str, note: str) -> str:
         return line if not note else retake_text(line, note)

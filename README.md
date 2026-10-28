@@ -23,7 +23,7 @@ The Space needs a ~45 GB GPU. This launcher runs the same Studio locally, with t
 - **Fewer broken takes:** a [pause fix](#pause-fix) and a [stall guard](#stall-guard) for takes that go silent or drone, and [checks while streaming](#every-word-read-while-streaming) that catch skipped words and make the missing ones.
 - **Clean chunk joins:** each chunk's trailing breath and hiss fade out under the start of the next, without fading a word.
 - **Tags that work with clones.** [Tag guidance](#tag-guidance) makes a cloned voice follow `<whisper>` and other `<tags>`.
-- **Fish Audio's direction set:** all the paired and language tags of their Drama 3 guide in the palette, and words given as phonemes (IPA or Arpabet).
+- **Fish Audio's direction set:** all the paired and language tags of their Drama 3 guide in the palette, words given as phonemes (IPA or Arpabet), and a [pronunciation dictionary](#directing) of alias and phoneme rules for every script.
 - **Subtitles:** import an `.srt` as a timed script, or export the subtitles of any take.
 - **Reference clips up to 60 s** instead of 20 s.
 - **A JSON [API](#api)** for scripts and other apps.
@@ -69,6 +69,8 @@ Start loads the model on the CPU, moves it into place (about a minute), and open
 | Duration hint | `[audio tokens: 65]` | Asks for about 3 s (about 21.5 per second) |
 
 None of these are spoken. The script box highlights them, and the **Direction tags** palette under it inserts them: its Span and Language rows wrap the selected words, and **phonemes** wraps phonemes you typed. The tag lists, language tags and IPA are from Fish Audio's Drama 3 guide ([fishaudio/docs #239](https://github.com/fishaudio/docs/pull/239), [#292](https://github.com/fishaudio/docs/pull/292)). The Space refuses `<|…|>` tokens in a script; here the phoneme pair is let through, and every other one still is refused. A word given as phonemes is left out of the word checks (Whisper hears the word, the script only has its sounds) and of subtitles.
+
+**Pronunciation dictionary** (under **How to direct**): rules applied to every script, the Studio's and the API's, as Fish Audio's pronunciation dictionaries ([fishaudio/docs #292](https://github.com/fishaudio/docs/pull/292)). A *phoneme* rule reads its input as the output's phonemes (`Siobhan` → `ʃɪˈvɔːn`); an *alias* rule reads the output instead (`km/h` → `kilometers per hour`, `k8s` → `Kubernetes`). As there: the first of duplicate inputs wins, the earliest match and then the longest input wins, matching ignores case unless *Case sensitive* is ticked, and replacements are not matched again. Here an input that starts or ends with a letter or digit matches whole words only, and `[directions]`, `<tags>` and a `Direction:` line are left alone. **Import .pls** adds a PLS lexicon's `<phoneme>` and `<alias>` entries; **Download .pls** saves the rules. They are kept in `cache/pronunciation.json`.
 
 ### Takes, notes and edits
 
@@ -305,6 +307,7 @@ The Studio's checkboxes and sliders cover most of these; the environment variabl
 | `DRAMA3_EXPERIMENTAL_SAMPLING` | `0` | Start with the Studio's "Enable Experimental Changes" on: the main token drawn with no top-p cut, a stalled take's remake with an uncut repeat-avoiding redraw (from torenyx/drama3-24gb), acoustic codebook heads capped at top-k 30 and the redraw keeping the token that crosses top-p (SGLang Omni, 2026-10-20), and in Quality Mode the register guard: a take with a phrase that jumps far above the voice's pitch is made once more (drama-tensorfold). Half as many drones in testing |
 | `DRAMA3_EXPERIMENTAL_SAMPLER` | `fixes` | The sampler the Experimental box starts with: `fixes` (the community fixes), `reference` (Fish reference sampling) or `reference_ras` (with the RAS fallback) |
 | `DRAMA3_EPSILON_CUTOFF` | `0.001` | Fish reference sampling's epsilon cutoff on the main token: less probable candidates are never drawn |
+| `DRAMA3_PRONUNCIATION` | `cache/pronunciation.json` | Where the pronunciation dictionary's rules are kept |
 | `DRAMA3_REGISTER_ST` | `6` | The register guard's jump, in semitones above the take's other phrase openings (`0` = off) |
 | `DRAMA3_WARM_UP` | `1` | `0` skips the startup warm-up take (always skipped by the portable engine) |
 | `DRAMA3_COMPILE` | `1` | `0` turns off regional `torch.compile` (NVIDIA) |
@@ -325,6 +328,7 @@ The app is a FastAPI server with Gradio mounted at `/` and `/workflow/`. The sim
 | `POST` | `/api/generate` | Generate a take; the response is a `text/event-stream` |
 | `GET` | `/api/takes/{take_id}.wav` | The finished take as WAV |
 | `GET` | `/api/takes/{take_id}.srt` | Subtitles of the take (its script timed by Whisper) |
+| `GET` / `PUT` | `/api/pronunciation` | The pronunciation dictionary: `{"rules": [{"key": "k8s", "value": "Kubernetes", "type": "alias", "case_sensitive": false}]}`; a `PUT` replaces every rule and answers with the rules in use and an `errors` list for any left out |
 
 `POST /api/generate` body:
 
@@ -426,7 +430,7 @@ The Gradio endpoints are also available through `gradio_client` (`Client("http:/
 - T8star's [ComfyUI-Drama3-T8](https://github.com/T8mars/Comfyui-Drama-3) for the idea behind the stall guard.
 - [SGLang Omni](https://github.com/sgl-project/sglang-omni) (Apache-2.0) for the sampler fixes behind the experimental codebook cap and crossing token, found through [Frosty40's B70 Turbo](https://huggingface.co/Frosty40/Drama-3-B70-Turbo-GGUF); [torenyx/drama3-24gb](https://github.com/torenyx/drama3-24gb) for the drone analysis behind the uncut main token and stall retry; [drama-tensorfold](https://github.com/plotarmordev/drama-tensorfold) for the register guard; [bidirectional-voice-claude](https://github.com/gabacool/bidirectional-voice-claude) for resuming cut-off lines and joining paragraph breaks; [mlx-speech](https://github.com/appautomaton/mlx-speech) for the length hint. These are reimplemented here, not copied.
 - [SGLang Omni #3278](https://github.com/sgl-project/sglang-omni/pull/3278) and [vLLM-Omni #9503](https://github.com/vllm-project/vllm-omni/pull/9503) (stone.li, Apache-2.0) for the rule that keeps residual codes inside the codec's codebooks and for Fish Audio's reference sampling, adapted in `offload/upstream_sampling.py`.
-- Fish Audio's [Drama 3 guide](https://github.com/fishaudio/docs/pull/239) and [pronunciation docs](https://github.com/fishaudio/docs/pull/292) for the paired and language tags and phonemes in scripts.
+- Fish Audio's [Drama 3 guide](https://github.com/fishaudio/docs/pull/239) and [pronunciation docs](https://github.com/fishaudio/docs/pull/292) for the paired and language tags, phonemes in scripts, and the pronunciation dictionary's rules.
 
 The Space code is Apache-2.0. The vendored fish-speech code keeps its own license (`app/fish_speech/LICENSE`). The model weights are under the [Fish Audio Community License](https://huggingface.co/fishaudio/drama-3/blob/main/LICENSE), version 1.0:
 

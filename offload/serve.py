@@ -179,6 +179,10 @@ import reference_trim  # noqa: E402
 
 reference_trim.install(server)  # long reference clips are cut at the latest pause before the limit
 
+import pronunciation  # noqa: E402
+
+pronunciation.install(server)  # /api/pronunciation: the pronunciation dictionary every script uses
+
 if not hasattr(os, "statvfs"):
     server.shared_memory_report = lambda: "unavailable"
 if backend == "portable":

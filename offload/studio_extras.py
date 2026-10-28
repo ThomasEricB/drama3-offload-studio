@@ -25,7 +25,9 @@ is built, without changing the Space's files:
 - Direction tags: the paired tags and language tags of Fish Audio's Drama 3 guide
   (fishaudio/docs #239: soft, fast, stress, forceful; french, spanish, ...), and a chip
   that gives a word as phonemes (<|phoneme_start|>...<|phoneme_end|>, IPA or Arpabet:
-  fishaudio/docs #292); "How to direct" shows both.
+  fishaudio/docs #292); "How to direct" shows both. Under them, a pronunciation
+  dictionary of alias and phoneme rules for every script (pronunciation.py), with PLS
+  import and download.
 - Sampling: the seed (seeds.py), a field that opens empty: a new random seed per take
   (a Retake keeps its take's); a number in it (typed, the last take's, or a new one) is
   kept for every take. Each take shows its seed in the stage: a click on it keeps it.
@@ -38,10 +40,12 @@ import functools
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import chunking
 import long_takes
+import pronunciation
 import seeds
 import subtitles
 
@@ -259,7 +263,7 @@ HOW_TO_DIRECT_MORE = (
     "\n\n**Language** (experimental): `He bowed and said <japanese>ありがとうございました</japanese> before he left.`"
     "\n\n**Pronunciation:** `I am an <|phoneme_start|>ˈɛndʒəˈnɪr<|phoneme_end|>.` IPA in any language, or CMU "
     "Arpabet (`EH0 N JH AH0 N IH1 R`, the digit is the stress), pinyin, romaji. Select phonemes you typed and "
-    "click **phonemes** to wrap them.")
+    "click **phonemes** to wrap them; the **Pronunciation dictionary** below does it for every script.")
 
 
 def content_json(text: str) -> str:
@@ -293,6 +297,28 @@ def studio_js(text: str) -> str:
     else:
         print("[studio] phonemes chip: studio.js changed, it inserts a [phonemes] cue instead", flush=True)
     return text
+
+
+def rule_rows(rules) -> list[list]:
+    return [[rule.key, rule.type, rule.value, rule.case_sensitive] for rule in rules] or [["", "phoneme", "", False]]
+
+
+def rows_rules(rows) -> list:
+    rules = []
+    for row in rows or []:
+        row = list(row) + [""] * (4 - len(row))
+        key, kind, value, case = (str(row[0] or "").strip(), str(row[1] or "").strip().lower() or "phoneme",
+                                  str(row[2] or "").strip(), row[3])
+        if key or value:
+            rules.append(pronunciation.Rule(key=key, value=value, type=kind,
+                                            case_sensitive=case is True or str(case).lower() == "true"))
+    return rules
+
+
+def rules_status(errors: list[str]) -> str:
+    count = len(pronunciation.dictionary().rules)
+    text = f"{count} rule{'s' if count != 1 else ''} in use, from the next take."
+    return text + ("".join(f"\n- {error}" for error in errors) if errors else "")
 
 
 # The Experimental card's sampler switch: short names, and a line about the one picked
@@ -515,6 +541,8 @@ def extended_studio():
         accordion_init(self, *args, **kwargs)
         if label == "Direction tags":
             found["tags_box"] = self
+        if label == "How to direct" and "rules" not in found:
+            dictionary_controls()  # after "How to direct", in the Script card
 
     def extra_chips():
         found["extra_chips"] = chips = []
@@ -524,6 +552,59 @@ def extended_studio():
                     gr.HTML(f'<span class="plabel">{title}</span>', min_width=60, scale=0)
                     for tag in tags:
                         chips.append((gr.Button(tag, size="sm", min_width=40, elem_classes="chip"), tag, kind))
+
+    def dictionary_controls():
+        with gr.Accordion("Pronunciation dictionary", open=False, elem_id="pronunciation"):
+            gr.Markdown(
+                "Rules for every script, the Studio's and the API's (Fish Audio's pronunciation dictionaries). "
+                "**phoneme**: the input is read as the output's phonemes (IPA, or Arpabet / pinyin / romaji). "
+                "**alias**: the output is read instead (`km/h` → `kilometers per hour`). Whole words, any case "
+                "unless *Case sensitive*; directions and tags are left alone.", elem_classes="hint")
+            found["rules"] = gr.Dataframe(
+                value=rule_rows(pronunciation.dictionary().rules), headers=["Input", "Type", "Output", "Case sensitive"],
+                datatype=["str", "str", "str", "bool"], column_count=4, column_limits=(4, 4), type="array",
+                interactive=True, show_label=False, elem_id="pronunciation-rules")
+            with gr.Row():
+                found["rules_save"] = gr.Button("Save rules", size="sm", variant="primary")
+                found["rules_import"] = gr.UploadButton("Import .pls", size="sm", file_types=[".pls", ".xml"])
+                found["rules_download"] = gr.DownloadButton("Download .pls", size="sm")
+            found["rules_status"] = gr.Markdown(rules_status([]), elem_classes="hint")
+
+    def pls_file() -> str:
+        """The rules in use as a PLS lexicon, for the download button."""
+        folder = tempfile.mkdtemp(dir=os.environ.get("GRADIO_TEMP_DIR") or None)
+        path = os.path.join(folder, "pronunciation.pls")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(pronunciation.to_pls(pronunciation.dictionary().rules))
+        return path
+
+    def wire_dictionary():
+        from gradio.context import Context
+
+        rules, status, download = found["rules"], found["rules_status"], found["rules_download"]
+
+        def shown(messages):
+            rules_now = rule_rows(pronunciation.dictionary().rules)
+            return rules_now, rules_status(messages), gr.DownloadButton(value=pls_file())
+
+        def save(rows):
+            return shown(pronunciation.dictionary().set(rows_rules(rows)))
+
+        def import_pls(file, rows):
+            try:
+                with open(getattr(file, "name", file), "rb") as f:
+                    added = pronunciation.rules_from_pls(f.read())
+            except Exception as error:  # noqa: BLE001  (shown to the user)
+                return rows, f"Couldn't read that lexicon ({type(error).__name__}: {error}).", gr.DownloadButton()
+            errors = pronunciation.dictionary().set(rows_rules(rows) + added)
+            return shown([f"{len(added)} imported"] + errors)
+
+        outputs = [rules, status, download]
+        found["rules_save"].click(save, inputs=rules, outputs=outputs, queue=False, api_visibility="private")
+        found["rules_import"].upload(import_pls, inputs=[found["rules_import"], rules], outputs=outputs,
+                                     queue=False, api_visibility="private")
+        # On every page load: the rules the server uses now
+        Context.root_block.load(lambda: shown([]), outputs=outputs, queue=False, api_visibility="private")
 
     def seed_controls():
         """The seed, in Sampling after Top-k (seeds.py): the SEED_WIDGET control (driven by
@@ -693,6 +774,8 @@ def extended_studio():
             for button, tag, kind in found.get("extra_chips", []):
                 button.click(None, inputs=script, outputs=script, queue=False, api_visibility="private",
                              js=f"(text) => window.dramaInsert(text, {json.dumps(tag)}, {json.dumps(kind)})")
+            if "rules" in found:
+                wire_dictionary()
 
             def toggle(value):
                 long_takes.SETTINGS["long_retake"] = bool(value)
